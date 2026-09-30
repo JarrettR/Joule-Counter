@@ -10,6 +10,7 @@ import archiver from 'archiver';
 import fs from 'fs-extra';
 import path from 'path';
 
+import { type StreamIntegrity } from '../device/types';
 import { startPreventSleep, stopPreventSleep } from '../features/preventSleep';
 import { frameSize, type GlobalOptions, indexToTimestamp } from '../globals';
 import { type ChartState } from '../slices/chartSlice';
@@ -36,6 +37,8 @@ export interface PPK2Metadata {
         /** bytes per stored sample; absent in files from before voltage was added */
         frameSize?: number;
     };
+    /** losses of the stream the session was recorded from; absent if not known */
+    integrity?: StreamIntegrity;
     formatVersion?: number;
 }
 // 3: frames carry current, voltage and bits (10 bytes); 2 was current + bits.

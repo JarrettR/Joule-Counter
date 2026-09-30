@@ -17,7 +17,7 @@ import { unit } from 'mathjs';
 
 import { resetCache } from '../components/Chart/data/dataAccumulator';
 import SerialDevice from '../device/serialDevice';
-import { type SampleValues } from '../device/types';
+import { type SampleValues, type StreamIntegrity } from '../device/types';
 import {
     miniMapAnimationAction,
     resetMinimap,
@@ -40,6 +40,7 @@ import {
     isSavePending,
     samplingStartAction,
     samplingStoppedAction,
+    setDataIntegrity,
     setDeviceRunningAction,
     setPowerModeAction,
     setSavePending,
@@ -89,12 +90,37 @@ let updateRequestInterval: NodeJS.Timeout | undefined;
 let releaseFileWriteListener: (() => void) | undefined;
 let previousUnsignedBits: number | undefined;
 
+// Until when the stream's loss counters describe the data on screen: while
+// sampling, and a moment after a stop for the stream's tail. After that a
+// loaded file may own the figures.
+let integrityLiveUntil = 0;
+
+const sameIntegrity = (a: StreamIntegrity, b: StreamIntegrity | null) =>
+    b !== null &&
+    a.lostSamples === b.lostSamples &&
+    a.gaps === b.gaps &&
+    a.kitOverflows === b.kitOverflows &&
+    a.crcErrors === b.crcErrors &&
+    a.samplingTimeUs === b.samplingTimeUs;
+
+const publishIntegrity = (
+    dispatch: (action: ReturnType<typeof setDataIntegrity>) => unknown,
+    shown: StreamIntegrity | null = null,
+) => {
+    if (!device) return;
+    const integrity = device.getStreamIntegrity();
+    if (sameIntegrity(integrity, shown)) return;
+    DataManager().setIntegrity(integrity);
+    dispatch(setDataIntegrity(integrity));
+};
+
 export const setupOptions =
     (recordingMode: RecordingMode): AppThunk<RootState, Promise<void>> =>
     async (dispatch, getState) => {
         if (!device) return;
         try {
             await DataManager().reset();
+            dispatch(setDataIntegrity(null));
             dispatch(resetChartTime());
             dispatch(resetMinimap());
 
@@ -167,6 +193,8 @@ export const samplingStart =
                 break;
         }
         await device!.ppkAverageStart();
+        integrityLiveUntil = Infinity;
+        publishIntegrity(dispatch);
         startPreventSleep();
     };
 
@@ -177,6 +205,8 @@ export const samplingStop =
         dispatch(clearRecordingMode());
         dispatch(samplingStoppedAction());
         await device.ppkAverageStop();
+        // The stream's tail, and any loss in it, is still on its way.
+        integrityLiveUntil = Date.now() + 2000;
         stopPreventSleep();
         releaseFileWriteListener?.();
     };
@@ -321,6 +351,8 @@ export const open =
         let prevBits = 0;
         let nbSamples = 0;
         let nbSamplesTotal = 0;
+        // samples that arrived in the average being built (DataLogger mode)
+        let nbValidInAverage = 0;
 
         const onSample = ({ value, voltage, bits }: SampleValues) => {
             const state = getState();
@@ -333,24 +365,27 @@ export const open =
                 return;
             }
 
-            let cappedValue = value ?? 0.2;
+            // A sample the kit could not deliver has neither current nor
+            // voltage. NaN keeps it out of every sum and statistic, and the
+            // chart marks it as missing instead of drawing a dip to zero.
+            let cappedValue = value ?? NaN;
             // PPK 2 can only read till 200nA (0.2uA)
             if (cappedValue < 0.2) {
                 cappedValue = 0;
             }
-            // A missing sample carries no voltage either; NaN keeps it out
-            // of the power and energy sums.
             let sampleVoltage = voltage ?? NaN;
 
             const channelTriggerStatuses =
                 state.app.trigger.digitalChannelsTriggersStates;
             const unsignedBits = bits !== undefined ? bits & 0xff : 0;
-            const b16 = convertBits16(bits!);
+            // Logic levels that were never read stay unknown, not low.
+            const b16 = bits !== undefined ? convertBits16(bits) : 0;
 
             if (samplingRunning && sampleFreq < maxSampleFreq) {
                 const samplesPerAverage = maxSampleFreq / sampleFreq;
                 nbSamples += 1;
                 nbSamplesTotal += 1;
+                if (value !== undefined) nbValidInAverage += 1;
                 const f = Math.min(nbSamplesTotal, samplesPerAverage);
                 if (Number.isFinite(value) && Number.isFinite(prevValue)) {
                     cappedValue = prevValue + (cappedValue - prevValue) / f;
@@ -371,6 +406,13 @@ export const open =
                     return;
                 }
                 nbSamples = 0;
+                if (value === undefined) {
+                    // The average closes on a missing sample: store what the
+                    // rest of it gave, or nothing if none of it arrived.
+                    cappedValue = nbValidInAverage > 0 ? prevValue : NaN;
+                    sampleVoltage = nbValidInAverage > 0 ? prevVoltage : NaN;
+                }
+                nbValidInAverage = 0;
             }
 
             DataManager().addData(cappedValue, sampleVoltage, b16 | prevBits);
@@ -538,6 +580,12 @@ export const open =
         let renderIndex: number;
         updateRequestInterval = setInterval(
             () => {
+                if (Date.now() < integrityLiveUntil) {
+                    publishIntegrity(
+                        dispatch,
+                        getState().app.app.dataIntegrity,
+                    );
+                }
                 if (
                     renderIndex !== DataManager().getTotalSavedRecords() &&
                     getState().app.app.samplingRunning &&

@@ -17,8 +17,8 @@ jest.mock('../../features/recovery/SessionsListFileHandler', () => ({
     WriteSessions: jest.fn(),
 }));
 
-// Timestamps are at the default 50 kHz: 20 us per sample, so index 2 is
-// 0.04 ms. Selection columns: [timestamp, current, voltage, power, bits,
+// Timestamps are at the default 100 kHz: 10 us per sample, so index 2 is
+// 0.02 ms. Selection columns: [timestamp, current, voltage, power, bits,
 // bitsSeparated].
 describe('formatData', () => {
     it('should contain only current values', () => {
@@ -44,9 +44,9 @@ describe('formatData', () => {
             bitsData,
             selection,
         );
-        expect(content).toMatch(/0\.04,7\.000\s/);
-        expect(content).toMatch(/0\.06,8\.000\s/);
-        expect(content).toMatch(/0\.08,9\.000\s/);
+        expect(content).toMatch(/0\.02,7\.000\s/);
+        expect(content).toMatch(/0\.03,8\.000\s/);
+        expect(content).toMatch(/0\.04,9\.000\s/);
     });
 
     it('should contain voltage and power, empty where voltage is missing', () => {
@@ -74,11 +74,11 @@ describe('formatData', () => {
             selection,
         );
         expect(content).toMatch(
-            /0\.04,7\.000,2\.0000,14\.000,11111111,1,1,1,1,1,1,1,1/,
+            /0\.02,7\.000,2\.0000,14\.000,11111111,1,1,1,1,1,1,1,1/,
         );
         expect(content).toMatch(
-            /0\.06,8\.000,3\.0000,24\.000,00000000,0,0,0,0,0,0,0,0\s/,
+            /0\.03,8\.000,3\.0000,24\.000,00000000,0,0,0,0,0,0,0,0\s/,
         );
-        expect(content).toMatch(/0\.08,9\.000,,,10100010,1,0,1,0,0,0,1,0\s/);
+        expect(content).toMatch(/0\.04,9\.000,,,10100010,1,0,1,0,0,0,1,0\s/);
     });
 });

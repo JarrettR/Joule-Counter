@@ -49,16 +49,29 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 	} else {
 		shell_print(sh, "monitors  unavailable while streaming");
 	}
-	shell_print(sh, "stream    %s, %u samples, %u blocks sent",
-		    streaming ? "running" : "stopped", sm.samples_emitted, sm.blocks_sent);
-	shell_print(sh, "adc       %u END events (I+V scans), %u ISR entries, tacq I=%u V=%u",
-		    sm.end_events, sm.isr_entries, sampling_get_tacq(), sampling_get_tacq_v());
+	shell_print(sh, "stream    %s, %u samples in %u blocks, %u bytes sent",
+		    streaming ? "running" : "stopped", sm.samples_emitted, sm.blocks_sent,
+		    st.bytes_sent);
+	shell_print(sh, "adc       %u END events (I+V scans), %u ISR entries (%u spurious), "
+		    "tacq I=%u V=%u",
+		    sm.end_events, sm.isr_entries, sm.isr_spurious, sampling_get_tacq(),
+		    sampling_get_tacq_v());
 	shell_print(sh, "isr       %u ENDs missed, worst gap %u ENDs, worst run %u ticks (%u/sample)",
 		    sm.isr_missed_ends, sm.isr_max_end_gap, sm.isr_max_run_ticks,
 		    16000000U / PPK2_SAMPLE_RATE_HZ);
 	print_latency(sh, &sm);
-	shell_print(sh, "dropped   %u switching samples, %u blocks (ring), %u tx failures",
-		    sm.switch_dropped, sm.blocks_dropped, st.tx_failures);
+	shell_print(sh, "switching %u samples (sent as range %u)",
+		    sm.switch_samples, PPK2_RANGE_SWITCHING);
+	if (sm.pack_samples > 0) {
+		shell_print(sh, "packing   %u cycles/sample, worst block %u us",
+			    (uint32_t)(sm.pack_cycles / sm.pack_samples),
+			    sm.pack_cycles_max / (SystemCoreClock / 1000000U));
+	}
+	shell_print(sh, "lost      %u samples in %u ring overflows, %u tx failures, "
+		    "%u flush timeouts",
+		    sm.samples_dropped, sm.overflows, st.tx_failures, st.flush_timeouts);
+	shell_print(sh, "usb       %u waits for a free transfer slot timed out, %u test blocks",
+		    st.tx_stalls, st.test_blocks);
 	shell_print(sh, "commands  %u handled, %u unknown bytes", st.commands, st.unknown_bytes);
 
 	return 0;
@@ -335,19 +348,12 @@ static int cmd_cal_measure(const struct shell *sh, size_t argc, char **argv)
 
 /* ---- sampling ---------------------------------------------------------- */
 
-static int cmd_sample_discard(const struct shell *sh, size_t argc, char **argv)
-{
-	if (argc > 1) {
-		sampling_set_discard_switch(strtoul(argv[1], NULL, 0) != 0);
-	}
-
-	shell_print(sh, "switching samples are %s",
-		    sampling_get_discard_switch() ? "discarded" : "sent as range 7");
-	return 0;
-}
-
 static void print_latency(const struct shell *sh, const struct sampling_metrics *sm)
 {
+	if (sm->isr_end_phase_min <= sm->isr_end_phase_max) {
+		shell_print(sh, "scan end  ticks %u..%u of the period (SAMPLE at %u)",
+			    sm->isr_end_phase_min, sm->isr_end_phase_max, SAMPLING_SAMPLE_TICK);
+	}
 	shell_fprintf(sh, SHELL_NORMAL, "latency   END->ISR worst %u.%02u us; per us:",
 		      sm->isr_max_latency_ticks / 16U,
 		      (sm->isr_max_latency_ticks % 16U) * 100U / 16U);
@@ -456,7 +462,6 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_cal,
 );
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_sample,
-	SHELL_CMD_ARG(discard, NULL, "discard [0|1]: drop switching samples", cmd_sample_discard, 1, 1),
 	SHELL_CMD_ARG(tacq, NULL, "tacq [I 0-7] [V 0-7]: SAADC acquisition-time codes", cmd_sample_tacq, 1, 2),
 	SHELL_CMD_ARG(selftest, NULL, "selftest [seconds] [spin|idle] [period ticks]: sample without USB output", cmd_sample_selftest, 1, 3),
 	SHELL_CMD(reset, NULL, "Reset sampling metrics", cmd_sample_reset),

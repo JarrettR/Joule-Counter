@@ -8,8 +8,19 @@ import fs from 'fs-extra';
 import path from 'path';
 
 export type Data = { x: number; y: number };
-export type ResultData = { x: number; y: number | undefined };
-export type Collection = { length: number; min: Data[]; max: Data[] };
+export type ResultData = {
+    x: number;
+    y: number | undefined;
+    missing?: boolean;
+};
+/** missing counts each element's samples that never arrived; absent in
+ * minimaps saved before it was tracked */
+export type Collection = {
+    length: number;
+    min: Data[];
+    max: Data[];
+    missing?: number[];
+};
 
 const foldData = (data: Data[], select: (a: number, b: number) => number) => {
     for (let i = 0; i < data.length / 2; i += 1) {
@@ -33,6 +44,7 @@ export class FoldingBuffer {
             length: 0,
             min: Array(this.maxNumberOfElements),
             max: Array(this.maxNumberOfElements),
+            missing: Array(this.maxNumberOfElements).fill(0),
         };
         this.out = Array(this.maxNumberOfElements * 2);
     }
@@ -46,6 +58,7 @@ export class FoldingBuffer {
             x: timestamp,
             y: -Number.MAX_VALUE,
         };
+        if (this.data.missing) this.data.missing[this.data.length] = 0;
 
         this.data.length += 1;
     }
@@ -55,6 +68,12 @@ export class FoldingBuffer {
 
         foldData(this.data.min, Math.min);
         foldData(this.data.max, Math.max);
+        const { missing } = this.data;
+        if (missing) {
+            for (let i = 0; i < this.data.length / 2; i += 1) {
+                missing[i] = missing[i * 2] + missing[i * 2 + 1];
+            }
+        }
         this.data.length /= 2;
     }
 
@@ -68,6 +87,10 @@ export class FoldingBuffer {
         // workaround to support log y axis
         if (value < 200) {
             value = 200;
+        }
+
+        if (Number.isNaN(value) && this.data.missing) {
+            this.data.missing[this.data.length - 1] += 1;
         }
 
         this.lastElementFoldCount += 1;
@@ -102,14 +125,17 @@ export class FoldingBuffer {
     getData() {
         for (let i = 0; i < this.data.length; i += 1) {
             const isValid = this.data.max[i].y >= this.data.min[i].y;
+            const missing = (this.data.missing?.[i] ?? 0) > 0;
 
             this.out[i * 2] = {
                 x: this.data.min[i].x,
                 y: isValid ? this.data.min[i].y : undefined,
+                ...(missing && { missing }),
             };
             this.out[i * 2 + 1] = {
                 x: this.data.max[i].x,
                 y: isValid ? this.data.max[i].y : undefined,
+                ...(missing && { missing }),
             };
         }
         return this.out.slice(0, this.data.length * 2);
@@ -135,5 +161,6 @@ export class FoldingBuffer {
         this.data = result.data;
         this.maxNumberOfElements = result.maxNumberOfElements;
         this.numberOfTimesToFold = result.numberOfTimesToFold;
+        this.data.missing ??= Array(this.maxNumberOfElements).fill(0);
     }
 }

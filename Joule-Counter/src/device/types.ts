@@ -4,6 +4,21 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-4-Clause
  */
 
+/** What went missing from a stream, and why, since it started. */
+export interface StreamIntegrity {
+    /** samples the kit took that never reached the app */
+    lostSamples: number;
+    /** separate stretches of lost samples */
+    gaps: number;
+    /** gaps the kit reported as its own buffer overflowing: the samples
+     * were not read out fast enough */
+    kitOverflows: number;
+    /** blocks rejected for a bad CRC */
+    crcErrors: number;
+    /** sample period the counts refer to, µs */
+    samplingTimeUs: number;
+}
+
 export interface SampleValues {
     /** current, µA */
     value?: number;
@@ -48,9 +63,5 @@ export type serialDeviceMessage =
     | openingMessage
     | startedMessage
     | bufferMessage
-    | errorMessage;
-
-export interface Mask {
-    pos: number;
-    mask: number;
-}
+    | errorMessage
+    | Uint8Array;

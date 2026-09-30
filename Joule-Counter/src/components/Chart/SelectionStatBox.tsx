@@ -28,6 +28,8 @@ interface StatBoxProperties {
     energy?: number | null;
     /** mean DUT voltage, V */
     voltage?: number | null;
+    /** samples in the selection that never arrived */
+    missing?: number;
     processing?: boolean;
     progress?: number;
     resetCursor: () => void;
@@ -45,6 +47,7 @@ export default ({
     delta = null,
     energy = null,
     voltage = null,
+    missing = 0,
     processing = false,
     progress,
     resetCursor,
@@ -165,6 +168,16 @@ export default ({
                             u={unit(average! * seconds, 'uC')}
                         />
                         <Value label="energy" u={unit(energy ?? NaN, 'uJ')} />
+                        {missing > 0 && (
+                            <ValueRaw
+                                label="lost data"
+                                value={formatDurationHTML(
+                                    missing * DataManager().getSamplingTime(),
+                                )}
+                                alert
+                                title="Samples in this range never arrived from the kit; charge and energy count them at the mean of the rest."
+                            />
+                        )}
                     </>
                 )}
             </div>

@@ -1,6 +1,6 @@
 {
     "name": "joule-counter",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "displayName": "Joule Counter",
     "description": "Joule meter for the Nordic Power Profiler Kit II: current, voltage, power and energy",
     "homepage": "https://github.com/nordicsemi/pc-nrfconnect-ppk",

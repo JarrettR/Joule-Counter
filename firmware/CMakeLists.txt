@@ -21,3 +21,7 @@ target_sources(app PRIVATE
 	src/leds.c
 	src/shell_cmds.c
 )
+
+# The sampling interrupt, the block packer and the CRC run for every sample
+# at 100 kHz; the rest of the firmware stays size-optimised.
+set_source_files_properties(src/sampling.c src/protocol.c PROPERTIES COMPILE_OPTIONS -O2)

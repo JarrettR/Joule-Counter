@@ -107,9 +107,9 @@ describe('ExportDialog', () => {
     });
 
     test('should show the number of records only inside the window', () => {
-        // one-second default window at the default 50 kHz
-        const expectedNumberOfRecords = 50_000;
-        const numberOfRecordsText = '50000 records';
+        // one-second default window at the default 100 kHz
+        const expectedNumberOfRecords = 100_000;
+        const numberOfRecordsText = '100000 records';
 
         getTimestampMock.mockImplementation(() =>
             indexToTimestamp(expectedNumberOfRecords),
@@ -128,13 +128,13 @@ describe('ExportDialog', () => {
     });
 
     test('should open with the last option to export the selected area when area has been selected', () => {
-        const numberOfRecordsText = '40000 records';
+        const numberOfRecordsText = '80000 records';
 
         render(<ExportDialog />, [
             chartCursorAction({ cursorBegin: 1, cursorEnd: 800000 }),
             ...initialStateActions,
             // Chart cursor uses timestamps, and the default sampling rate is
-            // 50_000 samples/sec, so 0.8 s of selection is 40000 records.
+            // 100_000 samples/sec, so 0.8 s of selection is 80000 records.
         ]);
 
         const numberOfRecords = screen.getByText(numberOfRecordsText);

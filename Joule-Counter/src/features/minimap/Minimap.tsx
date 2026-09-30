@@ -10,6 +10,10 @@ import { classNames, colors } from '@nordicsemiconductor/pc-nrfconnect-shared';
 import { Chart, type ChartOptions } from 'chart.js';
 
 import minimapScroll from '../../components/Chart/plugins/minimap.scroll';
+import {
+    missingDataPlugin,
+    missingSegment,
+} from '../../components/Chart/plugins/utility';
 import { DataManager, indexToTimestamp } from '../../globals';
 import {
     getChartXAxisRange,
@@ -329,6 +333,8 @@ function initializeMinimapChart(
                         pointRadius: 0,
                         pointHoverRadius: 0,
                         pointHitRadius: 0,
+                        spanGaps: true,
+                        segment: missingSegment,
                     },
                 ],
             },
@@ -354,7 +360,7 @@ function initializeMinimapChart(
                     },
                 },
             } as MinimapOptions,
-            plugins: [minimapScroll],
+            plugins: [missingDataPlugin, minimapScroll],
         });
     }
 

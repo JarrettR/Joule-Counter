@@ -27,7 +27,7 @@ config PPK2_USB_PRODUCT
 
 config PPK2_DFU_SEMVER
 	string "Version string served on the DFU trigger interface"
-	default "joule_counter 0.1.0"
+	default "joule_counter 0.2.0"
 	help
 	  The app reads this string to decide whether it should offer to
 	  reprogram the kit. This firmware's wire protocol has diverged from
@@ -49,21 +49,13 @@ config PPK2_DEFAULT_VDD_MV
 	range 800 5000
 	default 3000
 
-config PPK2_DISCARD_SWITCH_SAMPLES
-	bool "Drop samples taken while the range switches are in transition"
-	default y
-	help
-	  The analog front end reports an inconsistent switch pattern for a few
-	  microseconds while it changes range. Such samples carry no usable
-	  current reading; dropping them keeps the sample counter contiguous so
-	  the desktop app never sees them.
-
 config PPK2_SAMPLE_RING_SAMPLES
 	int "Sample ring buffer depth (samples, power of two)"
-	default 4096
+	default 32768
 	help
-	  Eight 512-sample blocks by default: enough to ride out USB scheduling
-	  jitter without dropping data. 16 KiB of RAM.
+	  How long the host may stop reading before samples are lost: 32768
+	  samples are 328 ms at 100 kHz. Each sample takes 33 bits of RAM, so
+	  the default costs 132 KiB.
 
 config PPK2_USB_TX_INFLIGHT
 	int "Sample blocks queued to the USB controller at once"

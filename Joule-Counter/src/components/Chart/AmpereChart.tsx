@@ -48,6 +48,7 @@ import dragSelectPlugin, { type DragSelect } from './plugins/chart.dragSelect';
 import triggerLevelPlugin from './plugins/chart.triggerLevel';
 import triggerOriginPlugin from './plugins/chart.triggerOrigin';
 import zoomPanPlugin, { type ZoomPan } from './plugins/chart.zoomPan';
+import { missingDataPlugin, missingSegment } from './plugins/utility';
 
 const yAxisWidth = 64;
 const rightMargin = 32;
@@ -58,9 +59,19 @@ interface Cursor {
     cursorEnd?: null | number;
 }
 
+export interface CrossHairValue {
+    /** points sorted by x; each covers the time up to the next one */
+    data: AmpereState[];
+    scaleId: string;
+    format: (value: number) => string;
+    color: string;
+    visible: boolean;
+}
+
 export interface AmpereChartOptions extends ChartOptions<'line'> {
     formatX: (usecs: number) => string | string[] | undefined;
-    formatY: (current: number) => string;
+    /** Traces the crosshair reads out at the cursor time, top to bottom */
+    crossHairValues?: CrossHairValue[];
     snapping: boolean;
     live: boolean;
     windowDuration: number;
@@ -92,6 +103,8 @@ interface AmpereChartProperties {
     chartRef: React.MutableRefObject<null | AmpereChartJS>;
     cursorData: CursorData;
     lineData: AmpereState[];
+    /** mean current per rendered point, nA */
+    currentMeanLineData: AmpereState[];
     /** mean power per rendered point, \u00B5W */
     powerLineData: AmpereState[];
     /** mean DUT voltage per rendered point, V */
@@ -173,6 +186,7 @@ export default ({
     chartRef,
     cursorData: { begin, end },
     lineData,
+    currentMeanLineData,
     powerLineData,
     voltageLineData,
     processing,
@@ -213,6 +227,8 @@ export default ({
                 pointBorderColor: dataColor,
                 pointHoverBorderColor: dataColor,
                 tension: snapping ? 0.2 : 0,
+                spanGaps: true,
+                segment: missingSegment,
                 label: 'Current',
                 xAxisID: 'xScale',
                 yAxisID: 'yScale',
@@ -229,6 +245,8 @@ export default ({
                 pointHoverRadius: 0,
                 pointHitRadius: 0,
                 tension: 0,
+                spanGaps: true,
+                segment: missingSegment,
                 label: 'Power',
                 xAxisID: 'xScale',
                 yAxisID: 'yScalePower',
@@ -243,6 +261,8 @@ export default ({
                 pointHoverRadius: 0,
                 pointHitRadius: 0,
                 tension: 0,
+                spanGaps: true,
+                segment: missingSegment,
                 label: 'Voltage',
                 xAxisID: 'xScale',
                 yAxisID: 'yScaleVoltage',
@@ -364,7 +384,29 @@ export default ({
         maintainAspectRatio: false,
         animation: false,
         formatX: value => timestampToLabel(value, systemTime),
-        formatY: formatCurrent,
+        crossHairValues: [
+            {
+                data: currentMeanLineData,
+                scaleId: 'yScale',
+                format: formatCurrent,
+                color: dataColor,
+                visible: traces.current,
+            },
+            {
+                data: voltageLineData,
+                scaleId: 'yScaleVoltage',
+                format: formatVoltage,
+                color: voltageColor,
+                visible: traces.voltage,
+            },
+            {
+                data: powerLineData,
+                scaleId: 'yScalePower',
+                format: formatPower,
+                color: powerColor,
+                visible: traces.power,
+            },
+        ],
         snapping,
         live,
         windowDuration,
@@ -381,6 +423,7 @@ export default ({
     const dispatch = useDispatch();
 
     const plugins = [
+        missingDataPlugin,
         dragSelectPlugin,
         zoomPanPlugin,
         triggerLevelPlugin,

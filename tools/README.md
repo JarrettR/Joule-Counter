@@ -56,10 +56,13 @@ python ppktool.py metadata COM21
 # Save that reply to a file (read-only; see ../baseline/CALIBRATION.md)
 python ppktool.py backup-cal COM21 -o my-kit.txt
 
-# Stream for 2 s: sample count, counter gaps, per-range raw ADC mean/spread
-python ppktool.py stream COM21 --seconds 2            # baseline/ or stock: one word per sample
-python ppktool.py stream COM21 --seconds 2 --words 2  # firmware/: adds the voltage channel
-python ppktool.py stream COM21 --seconds 2 --words 2 --dump raw.bin   # keep the raw words
+# Stream for 2 s: samples, exact losses, per-range raw ADC mean/spread
+python ppktool.py stream COM21 --seconds 2                 # format taken from the metadata
+python ppktool.py stream COM21 --seconds 2 --dump raw.bin  # keep the raw stream too
+
+# What the USB link carries (firmware/ only)
+python ppktool.py linktest COM21 --seconds 5         # full-width blocks: the stream's worst case
+python ppktool.py linktest COM21 --seconds 5 --pack  # packed pseudo-random samples, all checked
 
 # Mode, source-mode voltage, DUT output
 python ppktool.py output COM21 --mode source --vdd 3300 --on 1
@@ -68,10 +71,21 @@ python ppktool.py output COM21 --mode source --vdd 3300 --on 1
 python ppktool.py shell COM20
 ```
 
-With `--words 2` the stream summary also prints the voltage word's raw mean
-and spread and its uncalibrated conversion to millivolts (`raw × 1800 / 8192
-× 5`, matching the `VFS`/`VDIV` lines in the Joule Counter firmware's
-metadata reply).
+`stream` asks for the metadata first: a `BlockFormat` line means the Joule
+Counter block stream (`firmware/`), otherwise it reads one word per sample
+(`baseline/`, stock); `--format` overrides that. For the block stream the
+summary gives the bits per sample the packing achieved, every gap in the
+sample index with its cause (the kit's ring overflowing, or lost on the
+way), CRC errors, and the voltage channel's raw mean and spread with its
+uncalibrated conversion to millivolts (`raw × 1800 / 8192 × 5`, matching the
+`VFS`/`VDIV` lines in the metadata reply).
+
+`linktest` has the firmware send test blocks as fast as the host takes
+them. Plain ones are full width, 33 bits a sample, so the result is what
+the link carries for the stream's worst case (the stream itself needs
+416 kB/s at most). With `--pack` they carry pseudo-random samples of every
+width combination, and each one is compared with this side's copy of the
+generator, a check of the packing end to end.
 
 ## Flashing over USB
 

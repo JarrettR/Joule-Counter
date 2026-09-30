@@ -19,14 +19,22 @@ export const ValueRaw = ({
     label,
     value,
     white,
+    alert,
+    title,
 }: {
     label: string;
     value: string | React.ReactElement<any, any> | null;
     white?: boolean;
+    /** a problem the user should see: drawn in red */
+    alert?: boolean;
+    /** explanation shown on hover */
+    title?: string;
 }) => (
     <div
+        title={title}
         className={classNames(
-            'tw-flex tw-h-14 tw-grow tw-flex-col tw-justify-center tw-p-0.5 tw-text-gray-700',
+            'tw-flex tw-h-14 tw-grow tw-flex-col tw-justify-center tw-p-0.5',
+            alert ? 'tw-text-red' : 'tw-text-gray-700',
             white ? 'tw-bg-white' : 'tw-bg-gray-100',
         )}
     >

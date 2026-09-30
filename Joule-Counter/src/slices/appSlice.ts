@@ -10,6 +10,7 @@ import { createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import os from 'os';
 
 import { type Capabilities } from '../device/abstractDevice';
+import { type StreamIntegrity } from '../device/types';
 import {
     getDiskFullTrigger as getPersistedDiskFullTrigger,
     getPreferredSessionLocation,
@@ -30,6 +31,8 @@ interface AppState {
     sessionFolder?: string;
     savePending: boolean;
     sessionRecoveryPending: boolean;
+    /** losses of the stream behind the data on screen; null if not known */
+    dataIntegrity: StreamIntegrity | null;
 }
 
 const initialState = (): AppState => ({
@@ -43,6 +46,7 @@ const initialState = (): AppState => ({
     isExportDialogVisible: false,
     savePending: false,
     sessionRecoveryPending: false,
+    dataIntegrity: null,
 });
 
 const appSlice = createSlice({
@@ -63,6 +67,8 @@ const appSlice = createSlice({
             ...initialState(),
             savePending: state.savePending,
             sessionRecoveryPending: state.sessionRecoveryPending,
+            // The recording stays on screen after the kit goes away.
+            dataIntegrity: state.dataIntegrity,
         }),
         setDeviceRunningAction: (
             state,
@@ -109,6 +115,12 @@ const appSlice = createSlice({
         setSessionRecoveryPending: (state, action: PayloadAction<boolean>) => {
             state.sessionRecoveryPending = action.payload;
         },
+        setDataIntegrity: (
+            state,
+            action: PayloadAction<StreamIntegrity | null>,
+        ) => {
+            state.dataIntegrity = action.payload;
+        },
     },
 });
 
@@ -127,6 +139,8 @@ export const isSessionRecoveryPending = (state: RootState) =>
 export const getFileLoaded = (state: RootState) => state.app.app.fileLoadedName;
 export const isFileLoaded = (state: RootState) =>
     !!state.app.app.fileLoadedName;
+export const getDataIntegrity = (state: RootState) =>
+    state.app.app.dataIntegrity;
 
 export const {
     deviceOpenedAction,
@@ -144,6 +158,7 @@ export const {
     setSavePending,
     setSessionRecoveryPending,
     clearFileLoadedAction,
+    setDataIntegrity,
 } = appSlice.actions;
 
 export default appSlice.reducer;

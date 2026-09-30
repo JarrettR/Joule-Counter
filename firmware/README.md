@@ -8,8 +8,8 @@ can compute power and integrate energy. Built on nRF Connect SDK / Zephyr.
 This is a fork of `../baseline/`, which is a wire-compatible PPK2
 reproduction. The two share the hardware description, calibration handling,
 supply-path control and USB composite layout; what differs is the sampler
-(two channels instead of one), the wire format, the sample rate and the
-firmware's identity.
+(two channels instead of one), the wire format (packed, indexed,
+CRC-checked blocks), the stream's buffering and the firmware's identity.
 
 Target: **nRF52840-QIAA** (U12, aQFN73) — Cortex-M4F, `ppk2/nrf52840`.
 
@@ -54,7 +54,7 @@ The kit enumerates as VID `0x1915` / PID `0xC00A` (unchanged, so the existing
 DFU-trigger driver binding keeps working), product string `Joule Counter`,
 with Nordic's **DFU trigger** interface first, then the **data port** and the
 **shell port** (both CDC ACM). The DFU trigger reports
-`CONFIG_PPK2_DFU_SEMVER` = `joule_counter 0.1.0`; the Joule-Counter app
+`CONFIG_PPK2_DFU_SEMVER` = `joule_counter 0.2.0`; the Joule-Counter app
 compares that string exactly, so it leaves this firmware alone and offers to
 reprogram anything else (stock or `baseline/`) it finds on a kit.
 
@@ -62,50 +62,94 @@ Commands are one opcode byte plus fixed-length arguments. Those the app uses:
 
 | Opcode | Command | Arguments | Effect |
 | --- | --- | --- | --- |
-| `0x06` | AverageStart | — | start the 50 kHz current+voltage stream |
-| `0x07` | AverageStop | — | stop the stream, flush the last partial block |
+| `0x06` | AverageStart | — | start the 100 kHz current+voltage stream |
+| `0x07` | AverageStop | — | stop the stream; its tail and a final block go out first |
 | `0x0C` | DeviceRunningSet | on (1 byte) | `VOUT_EN`: connect the DUT output |
 | `0x0D` | RegulatorSet | mV (2 bytes, big-endian) | source-mode output voltage |
 | `0x11` | SetPowerMode | 1 = ampere, 2 = source | select the supply path |
 | `0x19` | GetMetadata | — | reply with the calibration text, ending in `END` |
 | `0x20` | Reset | — | reboot |
 | `0x25` | SetUserGains | range, float32 LE | store a per-range user gain |
+| `0x30` | LinkTest | seconds (1–60), +0x80 for packed | send test blocks flat out; `tools/` only (see below) |
 
 PPK1-era opcodes (`0x01`–`0x05`, `0x08`–`0x0A`, `0x0E`–`0x0F`, `0x12`,
 `0x15`–`0x16`) are consumed with their argument bytes and ignored.
 
-Each streamed sample is **two** little-endian 32-bit words, current first,
-then voltage, as `Joule-Counter/src/device/serialDevice.ts` decodes them
-(`PPK2_WORDS_PER_SAMPLE` in `ppk2.h`). This is not the PPK2 wire format.
+The stream is a sequence of **blocks**, one USB transfer each, laid out in
+`ppk2.h` and decoded by `Joule-Counter/src/device/serialDevice.ts` and
+`tools/ppk_protocol.py`. This is not the PPK2 wire format.
 
-Current word — identical to the PPK2's:
+A block covers up to 512 consecutive samples (5.12 ms). Its 24-byte header:
 
-| Bits | Content |
-| --- | --- |
-| 0–13 | ADC value: the 14-bit differential SAADC result `>> 2`, clamped at 0. The app multiplies by 4, so the EEPROM's `O` offsets are in raw 14-bit counts. |
-| 14–16 | range 0–4 (1 kΩ … 0.05 Ω shunt), or 7 while the switches settle |
-| 17 | VBUS present on the auxiliary USB connector J1 |
-| 18–23 | six-bit counter, contiguous over emitted samples |
-| 24–31 | logic port D0–D7 |
+| Offset | Size | Content |
+| --- | --- | --- |
+| 0 | 2 | magic `JC` |
+| 2 | 1 | format version, 1 |
+| 3 | 1 | flags: bit 0 J1 VBUS present, bit 1 last block of the stream, bit 2 the gap before this block is a ring overflow, bit 3 link test |
+| 4 | 4 | stream index of the first sample (LE) |
+| 8 | 2 | number of samples, 0–512 (LE) |
+| 10 | 1 | stream id, changes with every AverageStart |
+| 11 | 1 | reserved, 0 |
+| 12 | 2 + 2 | current base, voltage base (LE) |
+| 16 | 1 + 1 | range base, logic base |
+| 18 | 1 | current width \| voltage width << 4 |
+| 19 | 1 | range width \| logic width << 4 |
+| 20 | 4 | CRC-32 (the zlib one) of bytes 0–19, then the payload (LE) |
 
-Voltage word:
+A sample has four fields:
 
-| Bits | Content |
-| --- | --- |
-| 0–13 | `VDUT+` ADC value, same `>> 2`/clamp convention: AIN4 against AGND, gain 1/3, through the board's 120 kΩ/30 kΩ divider |
-| 14–31 | reserved, zero |
+| Field | Values | Content |
+| --- | --- | --- |
+| current | 0–2047 | the 14-bit differential SAADC result `>> 2`, clamped at 0. The app multiplies by 4, so the EEPROM's `O` offsets are in raw 14-bit counts. |
+| range | 0–7 | 0–4 (1 kΩ … 0.05 Ω shunt), 7 while the switches settle, 6 for a conversion the firmware missed |
+| voltage | 0–2047 | `VDUT+`, same `>> 2`/clamp convention: AIN4 against AGND, gain 1/3, through the board's 120 kΩ/30 kΩ divider |
+| logic | 0–255 | logic port D0–D7 |
 
-The host converts it linearly, `mV = raw × VFS / 8192 × VDIV`, with `VFS`
-(1800) and `VDIV` (5.000) taken from the metadata reply rather than hard-coded,
-so a gain/offset calibration can be added later without another format
-change. The channel is uncalibrated; expect it to sit within about 0.5 % of
-the 40 µs oversampled `vdut` monitor.
+The payload stores each field as its offset from the header's base for it,
+in the header's width for it: the block's minimum, and just enough bits for
+the block's spread. Sample *k* occupies bits *k·W* to *k·W+W−1* of the
+payload, *W* being the sum of the widths, fields in the order of the table,
+least significant bit first, in 32-bit little-endian words zero-padded at
+the end. A steady signal needs about 8 bits a sample, headers included; a
+block can never need more than 11 + 3 + 11 + 8 = 33, which bounds the link
+load at 416 kB/s.
 
-`GetMetadata` carries three extra lines before `END`: `VFS`, `VDIV` and
-`SampleRate: 50000`. The app reads the rate from there.
+Every conversion of a stream has a slot, counting from zero at
+AverageStart, and the samples of a block are consecutive slots. A block the
+host never receives, or one the firmware had to drop because the host read
+too slowly (flag bit 2), therefore shows up as a gap of exactly the right
+length before the next block, and the time axis never shifts. Scans the
+interrupt handler missed keep their slot as range 6, and scans taken while
+the range switches were moving keep theirs as range 7; the app holds the
+current of the sample before and uses the voltage as measured. The magic,
+the header checks and the CRC let a reader resynchronise on anything that is
+not a block, such as stale bytes when a port is reopened.
 
-Samples go out in 512-sample (4 KiB) bulk transfers, several queued to the USB
-controller at once, from a 4096-sample ring buffer (32 KiB).
+The host converts the voltage linearly, `mV = raw × VFS / 8192 × VDIV`,
+with `VFS` (1800) and `VDIV` (5.000) taken from the metadata reply rather
+than hard-coded, so a gain/offset calibration can be added later without
+another format change. The channel is uncalibrated; expect it to sit within
+about 0.5 % of the 40 µs oversampled `vdut` monitor.
+
+`GetMetadata` carries four extra lines before `END`: `VFS`, `VDIV`,
+`SampleRate: 100000` and `BlockFormat: 1`. The app reads the rate from
+there and refuses a block format it does not know. If a stream is running,
+GetMetadata stops it first, and the reply follows the stream's final block.
+
+Blocks are packed from a 32768-sample ring (328 ms at 100 kHz) straight into
+USB buffers, up to four queued to the controller at once. If the host stops
+reading for longer than the ring covers, the oldest samples are dropped a
+block at a time and the next block that goes out is flagged. Closing the
+port stops the stream and drops whatever was still queued, so the next
+reader starts clean.
+
+LinkTest sends 512-sample blocks flagged as a test for the given number of
+seconds, then a final one. Plain, every block is full width (33 bits a
+sample, the stream's worst case) with payload word *k* = first + *k*, which
+shows what the link sustains. With 0x80 added, the blocks instead carry
+pseudo-random samples of every width combination, packed like the stream
+and seeded with first + 1, so a host can check its decoder against its own
+copy of the generator (`ppktool.py linktest --pack`).
 
 ### Measurement chain
 
@@ -120,26 +164,32 @@ controller at once, from a 4096-sample ring buffer (32 KiB).
   channels the SAADC returns the second channel's result in both slots.
   Burst only belongs with oversampling (nrfx ties the two together), so the
   stream leaves it to the oversampled single conversions.
-- **Rate: 50 kHz, set by the USB link, not by the ADC.** Both channels
-  convert comfortably within a 10 µs period with acquisition-time code 7, and
-  the voltage reading is insensitive to that code (TACQ 0–5 agree within
-  0.3 %). But two words per sample at 100 kHz is 800 kB/s, and a full-speed
-  CDC link sustains roughly 530 kB/s; 50 kHz keeps the stream at the 400 kB/s
-  the one-word format already runs at, with margin.
-- **TIMER2** at 16 MHz with a 320-tick period fires `TASKS_SAMPLE` through PPI
-  every 20 µs; `EVENTS_END` re-arms the two-slot EasyDMA buffer through a
+- **Rate: 100 kHz.** Both channels convert within the 10 µs period with
+  acquisition-time code 7: the scan ends about 6.8 µs after it is triggered
+  (`ppk status` shows where in the period), and the voltage reading is
+  insensitive to that code (TACQ 0–5 agree within 0.3 %).
+- **TIMER2** at 16 MHz with a 160-tick period fires `TASKS_SAMPLE` through PPI
+  every 10 µs; `EVENTS_END` re-arms the two-slot EasyDMA buffer through a
   second PPI channel. The CPU only runs the END interrupt: it reads both
-  results, both GPIO ports, decodes the range and packs the two words.
+  results and GPIO port 0, decodes the range and stores one 33-bit sample in
+  the ring. Packing into blocks happens later, in the protocol thread.
+- **Anomaly 212.** Switching the SAADC from the stream's two-channel scan to
+  the monitors' single burst channel can leave it broken; on this kit the
+  next scan either converted one channel per trigger (half rate, the same
+  input in both slots) or delivered the two slots swapped. Every SAADC
+  reconfiguration therefore starts with Nordic's documented workaround, a
+  power cycle of the peripheral that keeps its offset calibration.
 - The **END handler is a zero-latency interrupt** (`CONFIG_ZERO_LATENCY_IRQS`,
   priority 0, above `irq_lock()`), so it makes no kernel calls. **TIMER3**
   counts END events over PPI and interrupts every 512 of them to wake the USB
-  sender; that is where the block-ready semaphore comes from. **TIMER4**
-  timestamps each END so the handler can measure its own latency (`ppk
-  status` prints the histogram).
+  sender; that is where the block-ready semaphore comes from. It also tells
+  the handler how many scans ended since its last run, so a missed one is
+  counted and keeps its slot. **TIMER4** timestamps each END so the handler
+  can measure its own latency (`ppk status` prints the histogram).
 - **The CPU stays awake while streaming.** Waking this Cortex-M4 from `WFI`
   takes about 12.5 µs (11.5 µs in the POWER constant-latency sub-mode). That
-  is more than the one-word firmware's 10 µs period and a large fraction of
-  this one's 20 µs, so `CONFIG_PPK2_STREAM_KEEPS_CPU_AWAKE` makes the idle
+  is more than the 10 µs sample period, so
+  `CONFIG_PPK2_STREAM_KEEPS_CPU_AWAKE` makes the idle
   thread skip `WFI` while the stream runs (Zephyr's
   `z_arm_on_enter_cpu_idle()` hook); END-to-handler latency is then about
   1.2 µs. The kit is USB powered and its own draw is not what it measures.
@@ -148,9 +198,8 @@ controller at once, from a 4096-sample ring buffer (32 KiB).
 - **Range** is read from `SW1..SW4` (P0.00, P0.01, P0.26, P0.27). The analog
   front end auto-ranges by itself; the comparators close the bypass switches
   cumulatively, so only the prefix patterns `0000, 0001, 0011, 0111, 1111` are
-  valid ranges 0–4. Anything else is a transition, reported as range 7 or —
-  by default — dropped without advancing the counter, so the app never sees it
-  (`ppk sample discard 0` sends them instead).
+  valid ranges 0–4. Anything else is a transition, reported as range 7; the
+  sample keeps its slot, so the time base stays exact through range changes.
 - **SAADC offset calibration** runs once at boot.
 - The **slow voltage monitors** (`VLDO`, `VBB`, `VIN`, `VDUT`, all through 5:1
   dividers; `VREF_IA` at gain 4) use 256× oversampled single conversions and
@@ -220,13 +269,13 @@ how to back them up.
 ### Shell (second serial port, 115200 8N1, waits for DTR)
 
 ```
-ppk status                       state, voltages, stream metrics
+ppk status                       state, voltages, stream, ISR, packing and USB metrics
 ppk meta read|raw|set|save|defaults|backup
 ppk power mode|vdd|out|ia|ia-trim
 ppk cal load 100k|10k|1k|100|off   switch a known load across the terminals
 ppk cal measure [n] [vse|vref|vldo|vbb|vin|vdut|ntc]
                                    averaged raw ADC of one channel, range, VDUT
-ppk sample discard|reset
+ppk sample reset                 clear the stream metrics
 ppk sample tacq [I 0-7] [V 0-7]    acquisition-time codes for the next start
 ppk sample selftest [s] [spin|idle] [period]
                                    run the sampler with no USB output and
@@ -319,9 +368,14 @@ The same map is in the devicetree as `gpio-line-names` and as the
 - **The stream is not PPK2-compatible.** Nordic's Power Profiler app lists
   the kit (same VID/PID) but cannot decode two-word samples; only
   `Joule-Counter/` can. To go back, flash `baseline/` or stock.
-- **50 kHz is a link budget, not an ADC limit.** The scan converts both
-  channels at 100 kHz; a faster host transport or a tighter packing would
-  allow the rate back up.
+- **100 kHz is the ADC's limit for two channels**, and the link has room
+  above it: on a Linux host the data port carried 578–587 kB/s with the
+  sampler idle and 500 kB/s with it running (`ppktool.py linktest`), against
+  416 kB/s for a stream whose every block needs the full 33 bits. A steady
+  signal needs about a quarter of that. Nordic's own troubleshooting notes
+  that some hosts, hubs and ports lose data even at the stock 400 kB/s; the
+  328 ms ring and the exact gap reporting are the answer to those, not more
+  bandwidth.
 - **Factory calibration procedure.** The calibration loads, the IA trim and
   metadata editing are all there, but there is no routine that derives `R`,
   `GS`, `GI`, `O`, `S`, `I` from them. Shipped kits carry factory values in

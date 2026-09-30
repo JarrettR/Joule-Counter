@@ -16,9 +16,15 @@ import {
     indexToTimestamp,
     timestampToIndex,
 } from '../../../../globals';
-import dataAccumulatorInitialiser from '../dataAccumulator';
+import dataAccumulatorInitialiser, {
+    calcStats,
+    type RangeStats,
+    resetCache,
+} from '../dataAccumulator';
 
-const SAMPLES_PER_SECOND = 50_000;
+// The app's default rate, so the accumulator's own time helpers agree with
+// the record below.
+const SAMPLES_PER_SECOND = 100_000;
 const TOTAL_SECONDS = 25;
 const record = Buffer.alloc(TOTAL_SECONDS * SAMPLES_PER_SECOND * frameSize);
 // Samples appended so far; grows during the run like a live session.
@@ -143,4 +149,88 @@ describe('live-mode accumulation', () => {
 
         expect(anomalies).toEqual([]);
     }, 120_000);
+});
+
+describe('missing samples', () => {
+    const SAMPLES = 10_000;
+    const GAP_FIRST = 1050;
+    const GAP_LAST = 1149; // 100 samples, straddling two 100-sample groups
+
+    beforeAll(() => {
+        for (let i = 0; i < SAMPLES; i += 1) {
+            const missing = i >= GAP_FIRST && i <= GAP_LAST;
+            writeSample(i, missing ? NaN : 5, missing ? NaN : 3);
+        }
+        latestIndex = SAMPLES;
+    });
+
+    beforeEach(() => resetCache());
+
+    const at = (index: number) => indexToTimestamp(index, SAMPLES_PER_SECOND);
+
+    it('marks every missing sample at full resolution', async () => {
+        const begin = at(1000);
+        const end = at(1199);
+        const result = await dataAccumulatorInitialiser().process(
+            begin,
+            end,
+            [],
+            1000,
+            end - begin,
+        );
+
+        const flagged = result.ampereLineData
+            .filter(p => p.missing)
+            .map(p => timestampToIndex(p.x as number, SAMPLES_PER_SECOND));
+        expect(flagged).toHaveLength(GAP_LAST - GAP_FIRST + 1);
+        expect(flagged[0]).toBe(GAP_FIRST);
+        expect(flagged[flagged.length - 1]).toBe(GAP_LAST);
+        expect(
+            result.averageLine.reduce((n, p) => n + (p.missing ?? 0), 0),
+        ).toBe(GAP_LAST - GAP_FIRST + 1);
+        // the power and voltage lines keep the gap instead of bridging it
+        expect(result.powerLine.filter(p => p.missing)).toHaveLength(
+            GAP_LAST - GAP_FIRST + 1,
+        );
+        expect(result.voltageLine.filter(p => p.missing)).toHaveLength(
+            GAP_LAST - GAP_FIRST + 1,
+        );
+    });
+
+    it('flags each group a gap touches when zoomed out', async () => {
+        const result = await dataAccumulatorInitialiser().process(
+            0,
+            at(SAMPLES - 1),
+            [],
+            100,
+            at(SAMPLES - 1),
+        );
+
+        // 100 samples a group: the gap is the second half of group 10 and
+        // the first half of group 11
+        const groups = result.averageLine
+            .map((p, g) => ({ g, missing: p.missing ?? 0 }))
+            .filter(p => p.missing > 0);
+        expect(groups).toEqual([
+            { g: 10, missing: 50 },
+            { g: 11, missing: 50 },
+        ]);
+        const flaggedPoints = result.ampereLineData.filter(p => p.missing);
+        expect(flaggedPoints).toHaveLength(4); // min and max of each group
+        // both groups still have samples, so they keep a value
+        expect(flaggedPoints.every(p => p.y === 5000)).toBe(true);
+        expect(result.powerLine.filter(p => p.missing)).toHaveLength(2);
+    });
+
+    it('counts the gap in the statistics and fills it with the mean', async () => {
+        const stats = await new Promise<RangeStats>(resolve => {
+            calcStats(resolve, 0, at(SAMPLES - 1));
+        });
+
+        expect(stats.missing).toBe(GAP_LAST - GAP_FIRST + 1);
+        expect(stats.average).toBeCloseTo(5, 6);
+        // 5 µA × 3 V = 15 µW over the whole 0.1 s, gap included
+        expect(stats.delta).toBeCloseTo(SAMPLES * 10, 6);
+        expect(stats.energy).toBeCloseTo(15 * 0.1, 6);
+    });
 });

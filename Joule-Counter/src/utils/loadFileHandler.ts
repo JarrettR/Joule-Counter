@@ -266,6 +266,7 @@ const loadPPK2File = async (
 
         DataManager().setSamplesPerSecond(metadata.metadata.samplesPerSecond);
         DataManager().loadData(sessionPath, metadata.metadata.startSystemTime);
+        DataManager().setIntegrity(metadata.integrity ?? null);
 
         window.removeEventListener('beforeunload', cleanUp);
         return DataManager().getTimestamp();

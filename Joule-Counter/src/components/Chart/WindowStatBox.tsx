@@ -9,6 +9,7 @@ import React from 'react';
 import { useSelector } from 'react-redux';
 import { unit } from 'mathjs';
 
+import { DataManager } from '../../globals';
 import { getTraces } from '../../slices/chartSlice';
 import { formatDurationHTML } from '../../utils/duration';
 import { Value, ValueRaw } from './StatBoxHelpers';
@@ -21,6 +22,8 @@ interface StatBoxProperties {
     energy?: number | null;
     /** mean DUT voltage, V */
     voltage?: number | null;
+    /** samples in the window that never arrived */
+    missing?: number;
 }
 
 /* Time, charge and energy are always shown; the per-quantity figures follow
@@ -32,6 +35,7 @@ export default ({
     delta = null,
     energy = null,
     voltage = null,
+    missing = 0,
 }: StatBoxProperties) => {
     const traces = useSelector(getTraces);
     const seconds = (delta || 1) / 1e6;
@@ -81,6 +85,17 @@ export default ({
                     u={unit(average! * seconds, 'uC')}
                 />
                 <Value white label="energy" u={unit(energy ?? NaN, 'uJ')} />
+                {missing > 0 && (
+                    <ValueRaw
+                        label="lost data"
+                        value={formatDurationHTML(
+                            missing * DataManager().getSamplingTime(),
+                        )}
+                        alert
+                        white
+                        title="Samples in this range never arrived from the kit; charge and energy count them at the mean of the rest."
+                    />
+                )}
             </div>
         </div>
     );

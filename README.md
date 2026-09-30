@@ -26,7 +26,7 @@ That said, use at your own risk. I won't take any responsibility, and my sample 
 
 | Folder | What it is |
 | --- | --- |
-| `firmware/` | The Joule Counter firmware (nRF Connect SDK / Zephyr). Streams 50 kHz current + voltage pairs. This is the one you want. |
+| `firmware/` | The Joule Counter firmware (nRF Connect SDK / Zephyr). Streams 100 kHz current + voltage pairs. This is the one you want. |
 | `Joule-Counter/` | Fork of Nordic's `pc-nrfconnect-ppk` desktop app that understands the new stream: voltage and power traces, energy in the statistics, extra CSV columns. Runs inside nRF Connect for Desktop. |
 | `baseline/` | A from-scratch, wire-compatible reimplementation of the stock PPK2 firmware. `firmware/` is forked from it. Kept because it works with Nordic's unmodified app and is the reference for everything the two share (hardware notes, calibration handling, USB layout). |
 | `tools/` | Python scripts for talking to a kit without the app: identify ports, read metadata, stream and summarize samples, back up calibration, package and flash builds over USB. |
@@ -36,10 +36,16 @@ That said, use at your own risk. I won't take any responsibility, and my sample 
 The nRF52840's SAADC can scan two channels on one sample trigger, so the
 current channel and the `VDUT+` divider are converted back to back and land
 in the same DMA buffer. Every sample the host receives is therefore a
-current word and a voltage word from within a few microseconds of each
+current and a voltage reading from within a few microseconds of each
 other, which is what makes instantaneous power honest through a pulsed load.
-The scan itself keeps up at 100 kHz; the rate is 50 kHz because two words per
-sample at 100 kHz is more than a full-speed USB CDC link reliably carries.
+The scan runs at 100 kHz, as fast as it goes for two channels.
+
+To get that through a full-speed USB link, the firmware packs the samples
+into 5 ms blocks, storing each field as an offset from the block's minimum
+in only as many bits as the block needs: about 8 bits a sample for a steady
+signal, never more than 33. Every block carries its position in the stream
+and a CRC, so data lost on the way shows up as a gap of exactly the right
+length rather than a shifted time axis.
 
 Energy in the app is summed sample by sample (Σ V·I·dt), not
 average-current × average-voltage × time. Those two differ exactly when it
@@ -57,7 +63,8 @@ You need a PPK2 (PCA63100 rev 1.0.1) and
 
 1. **Install the app.** Download `joule-counter-<version>.tgz` from this
    repository's Releases page and add it in nRF Connect for Desktop with
-   *Add local app*. Joule Counter appears under *Local apps*.
+   *Add local app*, or simply by drag-and-drop to the nRF Connect app.
+   Joule Counter appears under *Local apps*.
 
 2. **Plug the kit in and open the app.** It reads the firmware version off
    the kit and offers to program the Joule Counter firmware it bundles.
@@ -98,7 +105,7 @@ cd firmware
 Flash it over USB as described in `tools/README.md`, or with a J-Link on
 the SWD header. To have the app carry your build, copy
 `firmware/build/firmware/zephyr/zephyr.hex` over
-`Joule-Counter/firmware/joule_counter_0.1.0.hex` and keep
+`Joule-Counter/firmware/joule_counter_0.2.0.hex` and keep
 `CONFIG_PPK2_DFU_SEMVER` and the version string in
 `Joule-Counter/src/components/DeviceSelector.tsx` matching.
 

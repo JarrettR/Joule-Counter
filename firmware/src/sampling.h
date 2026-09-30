@@ -12,13 +12,25 @@
 #include <stdint.h>
 #include <zephyr/kernel.h>
 
+#include "ppk2.h"
+
+/* 16 MHz timer tick within each sample period at which the scan is triggered. */
+#define SAMPLING_SAMPLE_TICK	112U
+
 /* END-to-handler latency histogram, 1 us per bucket, last bucket open-ended. */
 #define SAMPLING_LATENCY_BUCKETS	24
 
 struct sampling_metrics {
+	/* Samples handed to the host, and samples lost to ring overflow. */
 	uint32_t samples_emitted;
-	uint32_t switch_dropped;
-	uint32_t blocks_dropped;
+	uint32_t samples_dropped;
+	uint32_t overflows;
+	/* Samples taken while the range switches were in transition. */
+	uint32_t switch_samples;
+	/* CPU cycles spent packing blocks, in total and for the worst block. */
+	uint64_t pack_cycles;
+	uint32_t pack_samples;
+	uint32_t pack_cycles_max;
 	uint32_t blocks_sent;
 	/* SAADC END events counted in hardware (TIMER3) since the last start. */
 	uint32_t end_events;
@@ -26,6 +38,8 @@ struct sampling_metrics {
 	 * conversions were lost to interrupt latency.
 	 */
 	uint32_t isr_entries;
+	/* Entries that found no new scan and were ignored. */
+	uint32_t isr_spurious;
 	/* END events that passed between consecutive ISR entries without one
 	 * of their own, and the largest such run.
 	 */
@@ -35,6 +49,11 @@ struct sampling_metrics {
 	uint32_t isr_max_run_ticks;
 	/* END event to handler entry, 16 MHz ticks, and its distribution. */
 	uint32_t isr_max_latency_ticks;
+	/* Earliest and latest scan end within the sample period, 16 MHz ticks
+	 * after the period starts (SAMPLE fires at SAMPLING_SAMPLE_TICK).
+	 */
+	uint32_t isr_end_phase_min;
+	uint32_t isr_end_phase_max;
 	uint32_t isr_latency_hist[SAMPLING_LATENCY_BUCKETS];
 };
 
@@ -65,20 +84,50 @@ bool sampling_running(void);
 /* Blocks until a block-sized run of samples is likely available. */
 int sampling_wait_block(k_timeout_t timeout);
 
-/* Samples ready to be taken; also recovers from ring overflow. */
-size_t sampling_available(void);
-
-/* Copies out up to n samples of PPK2_WORDS_PER_SAMPLE words each; dst must
- * hold n * PPK2_WORDS_PER_SAMPLE words. Returns the number of samples copied.
+/* A block taken by sampling_take_block(): where it sits in the stream and
+ * how its payload is packed (see ppk2.h).
  */
-size_t sampling_take(uint32_t *dst, size_t n);
+struct sampling_block {
+	uint32_t first;		/* stream index of the first sample */
+	uint16_t count;
+	bool overflow;		/* samples right before this block were lost */
+	bool last;		/* the stream has stopped; nothing follows */
+	uint16_t base[PPK2_FIELD_COUNT];
+	uint8_t width[PPK2_FIELD_COUNT];
+	uint16_t words;		/* payload length in 32-bit words */
+};
+
+/*
+ * True when sampling_take_block() has something to return: a full block
+ * while the stream runs, the remainder and the final marker once it stopped.
+ */
+bool sampling_block_ready(void);
+
+/*
+ * Packs the next block into payload, which must hold
+ * PPK2_BLOCK_PAYLOAD_WORDS(PPK2_BLOCK_SAMPLES, PPK2_SAMPLE_BITS_MAX) words.
+ * When the reader has fallen too far behind, skips ahead first and flags
+ * the block. Returns false if there is nothing to take; a stopped stream
+ * yields one final block with last set, possibly empty.
+ */
+bool sampling_take_block(uint32_t *payload, struct sampling_block *blk);
+
+/*
+ * Packs a block of pseudo-random samples, seeded by seed, the way stream
+ * blocks are packed, so a host can check the packing against its own copy
+ * of the generator. Uses the ring, so only while no stream runs.
+ */
+int sampling_test_block(uint32_t seed, uint32_t *payload, struct sampling_block *blk);
+
+/* Drops everything not taken yet, final marker included. */
+void sampling_discard(void);
+
+/* The stream has stopped and everything, final marker included, was taken. */
+bool sampling_drained(void);
 
 void sampling_get_metrics(struct sampling_metrics *m);
 void sampling_reset_metrics(void);
 void sampling_count_block_sent(void);
-
-void sampling_set_discard_switch(bool enable);
-bool sampling_get_discard_switch(void);
 
 /* SAADC acquisition-time code for the stream (CONFIG.TACQ, 0..7). Takes
  * effect at the next start. Exposed for experiments; see STREAM_TACQ_CODE.

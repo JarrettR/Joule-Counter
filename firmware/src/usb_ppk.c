@@ -2,10 +2,11 @@
  * USB composite device: PPK2 data port, shell port and DFU trigger.
  *
  * The data port is a CDC ACM function implemented here rather than through
- * Zephyr's UART-shaped CDC ACM class: the stream is 400 kB/s of 2 KiB blocks,
- * which is best served by queueing whole blocks straight onto the bulk IN
- * endpoint instead of trickling them through a UART FIFO one 64-byte packet
- * per work item. The shell rides on the stock class.
+ * Zephyr's UART-shaped CDC ACM class: the stream is about 415 kB/s of 2 KiB
+ * blocks, which is best served by packing each block straight into a USB
+ * buffer and queueing it whole on the bulk IN endpoint, instead of trickling
+ * it through a UART FIFO one 64-byte packet per work item. The shell rides
+ * on the stock class.
  *
  * The third function is Nordic's USB DFU trigger interface (vendor class,
  * subclass 1, protocol 1). nrf-device-lib reads the firmware version through
@@ -534,42 +535,81 @@ bool usb_ppk_data_connected(void)
 	       (cdc_data.line_state & SET_CONTROL_LINE_STATE_DTR) != 0;
 }
 
-int usb_ppk_data_send(const uint8_t *data, size_t len, k_timeout_t timeout)
+struct net_buf *usb_ppk_data_alloc(size_t size, k_timeout_t timeout, int *err)
 {
-	struct net_buf *buf;
 	uint8_t ep = cdc_desc.if1_in_ep.bEndpointAddress;
-	int ret;
+	struct net_buf *buf;
 
 	if (!atomic_test_bit(&cdc_data.state, CDC_ENABLED)) {
-		return -ENOTCONN;
+		*err = -ENOTCONN;
+		return NULL;
 	}
 
 	if (k_sem_take(&tx_slots, timeout) != 0) {
-		return -EAGAIN;
+		*err = -EAGAIN;
+		return NULL;
 	}
 
-	buf = usbd_ep_buf_alloc(&ppk_data, ep, len);
+	buf = usbd_ep_buf_alloc(&ppk_data, ep, size);
 	if (buf == NULL) {
 		k_sem_give(&tx_slots);
-		return -ENOMEM;
+		*err = -ENOMEM;
+		return NULL;
 	}
 
-	net_buf_add_mem(buf, data, len);
+	*err = 0;
+	return buf;
+}
+
+void usb_ppk_data_free(struct net_buf *buf)
+{
+	net_buf_unref(buf);
+	k_sem_give(&tx_slots);
+}
+
+int usb_ppk_data_submit(struct net_buf *buf)
+{
+	int ret;
 
 	/* A transfer that ends on a packet boundary needs a zero-length packet
 	 * behind it, or the host keeps waiting for more. The controller appends
 	 * it when asked, keeping this one buffer and one completion per block.
 	 */
-	udc_get_buf_info(buf)->zlp = ((len % BULK_MPS) == 0);
+	udc_get_buf_info(buf)->zlp = ((buf->len % BULK_MPS) == 0);
 
 	ret = usbd_ep_enqueue(&ppk_data, buf);
 	if (ret != 0) {
-		net_buf_unref(buf);
-		k_sem_give(&tx_slots);
-		return ret;
+		usb_ppk_data_free(buf);
 	}
 
-	return 0;
+	return ret;
+}
+
+void usb_ppk_data_abort(void)
+{
+	/* Only when something is queued: dequeueing an idle, enabled
+	 * endpoint does nothing but log about it.
+	 */
+	if (atomic_test_bit(&cdc_data.state, CDC_ENABLED) &&
+	    k_sem_count_get(&tx_slots) < CONFIG_PPK2_USB_TX_INFLIGHT) {
+		/* Each dequeued buffer completes with -ECONNABORTED through
+		 * cdc_request(), which returns its transfer slot.
+		 */
+		(void)usbd_ep_dequeue(&ppk_usbd, cdc_desc.if1_in_ep.bEndpointAddress);
+	}
+}
+
+int usb_ppk_data_send(const uint8_t *data, size_t len, k_timeout_t timeout)
+{
+	int err;
+	struct net_buf *buf = usb_ppk_data_alloc(len, timeout, &err);
+
+	if (buf == NULL) {
+		return err;
+	}
+
+	net_buf_add_mem(buf, data, len);
+	return usb_ppk_data_submit(buf);
 }
 
 int usb_ppk_init(void)

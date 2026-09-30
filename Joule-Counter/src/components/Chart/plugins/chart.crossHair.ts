@@ -8,8 +8,40 @@ import { colors } from '@nordicsemiconductor/pc-nrfconnect-shared';
 import { type Plugin } from 'chart.js';
 
 import type { AmpereChartJS } from '../AmpereChart';
+import type { AmpereState } from '../data/dataTypes';
 
 const { gray700: color, white } = colors;
+const labelHeight = 20;
+const labelGap = 2;
+const markerRadius = 3;
+// Space between the cursor line and the time and value labels
+const labelOffset = 15;
+
+// Finds the point covering time t: the last one at or before it, as long as
+// t is not past the end of the data by more than one point spacing.
+const pointAt = (data: AmpereState[], t: number) => {
+    let lo = 0;
+    let hi = data.length - 1;
+    let found = -1;
+    while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        const x = data[mid]?.x;
+        if (x != null && x <= t) {
+            found = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    const point = data[found];
+    if (point?.x == null) return undefined;
+
+    if (found === data.length - 1) {
+        const prevX = data[found - 1]?.x;
+        if (prevX == null || t - point.x > point.x - prevX) return undefined;
+    }
+    return point;
+};
 
 interface CrossHairPlugin extends Plugin<'line'> {
     instances: AmpereChartJS[];
@@ -49,21 +81,23 @@ const plugin: CrossHairPlugin = {
             return;
         }
 
-        let { offsetX, offsetY } = event;
+        const { offsetY } = event;
+        let { offsetX } = event;
 
         const drawY = id === 'ampereChart';
 
         if (snapping) {
+            // Snap by time only: an x/y distance would pick whichever point
+            // is closest to the mouse height when hovering off the trace.
+            // Points clipped by the Y range still count.
             const hit = chart.getElementsAtEventForMode(
                 event,
                 'nearest',
-                {},
+                { axis: 'x', intersect: false, includeInvisible: true },
                 true,
             )[0];
             if (hit) {
-                const { x, y } = hit.element;
-                offsetX = x;
-                offsetY = y;
+                offsetX = hit.element.x;
             }
         }
         plugin.moveEvent = { offsetX: offsetX - left, offsetY, drawY };
@@ -96,11 +130,12 @@ const plugin: CrossHairPlugin = {
         const {
             ctx,
             chartArea: { left, right, top, bottom },
-            scales: { xScale, yScale },
+            scales,
             config: {
-                options: { formatX, formatY },
+                options: { formatX, crossHairValues },
             },
         } = chart;
+        const { xScale } = scales;
         const { canvas } = ctx;
 
         if (!plugin.moveEvent) {
@@ -108,90 +143,96 @@ const plugin: CrossHairPlugin = {
             return;
         }
 
-        const { offsetX, offsetY } = plugin.moveEvent;
+        const { offsetX, offsetY, drawY } = plugin.moveEvent;
         const x = Math.ceil(offsetX - 0.5) - 0.5;
-        const y = Math.ceil(offsetY - 0.5) + 0.5;
+        const lineX = left + offsetX;
 
-        if (offsetX >= 0 && offsetX <= right - left) {
-            ctx.save();
-            ctx.lineWidth = 0.5;
-            ctx.strokeStyle = color;
-            ctx.beginPath();
-            ctx.moveTo(left + x, top);
-            ctx.lineTo(left + x, bottom);
-            ctx.closePath();
-            ctx.stroke();
+        const inY = offsetY >= top && offsetY <= bottom;
+        canvas.style.cursor = inY ? 'pointer' : 'default';
 
-            if (chart.height > 32 && formatX != null) {
-                const xCoordinate = xScale.getValueForPixel(left + offsetX);
-                if (xCoordinate != null) {
-                    const xLabel = formatX(xCoordinate);
-                    if (xLabel != null) {
-                        const [time, subsecond] = xLabel;
-                        const { width: tsWidth } = ctx.measureText(time);
-                        ctx.fillStyle = color;
-                        ctx.textAlign = 'right';
-                        ctx.fillRect(left + offsetX, top, tsWidth + 10, 33);
-                        ctx.fillStyle = white;
-                        ctx.textAlign = 'center';
-                        ctx.fillText(
-                            time,
-                            left + offsetX + 5 + tsWidth / 2,
-                            top + 13,
-                        );
-                        ctx.fillText(
-                            subsecond,
-                            left + offsetX + 5 + tsWidth / 2,
-                            top + 28,
-                        );
-                    }
-                }
+        if (offsetX < 0 || offsetX > right - left) return;
+
+        const t = xScale.getValueForPixel(lineX);
+        if (t == null) return;
+
+        // Each visible trace is read at the cursor time: a marker on the
+        // trace, and a label in its colour stacked below the time label.
+        const readouts =
+            inY && drawY && crossHairValues != null
+                ? crossHairValues.flatMap(
+                      ({ data, scaleId, format, color: bg, visible }) => {
+                          const scale = scales[scaleId];
+                          if (!visible || scale == null) return [];
+                          const point = pointAt(data, t);
+                          if (point?.y == null || Number.isNaN(point.y)) {
+                              return [];
+                          }
+                          return [
+                              {
+                                  text: format(point.y),
+                                  bg,
+                                  markerY: scale.getPixelForValue(point.y),
+                              },
+                          ];
+                      },
+                  )
+                : [];
+        const timeLabel =
+            chart.height > 32 && formatX != null ? formatX(t) : undefined;
+
+        ctx.save();
+        ctx.lineWidth = 0.5;
+        ctx.strokeStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(left + x, top);
+        ctx.lineTo(left + x, bottom);
+        ctx.closePath();
+        ctx.stroke();
+
+        const timeWidth =
+            timeLabel != null ? ctx.measureText(timeLabel[0]).width + 10 : 0;
+        const boxWidth = Math.max(
+            0,
+            ...readouts.map(({ text }) => ctx.measureText(text).width + 10),
+        );
+        // All labels sit on one side of the cursor line, flipping to the
+        // left together rather than run off the chart.
+        const flip =
+            lineX + labelOffset + Math.max(timeWidth, boxWidth) > right;
+        const labelLeft = (width: number) =>
+            flip ? lineX - labelOffset - width : lineX + labelOffset;
+
+        if (timeLabel != null) {
+            const [time, subsecond] = timeLabel;
+            const tsLeft = labelLeft(timeWidth);
+            ctx.fillStyle = color;
+            ctx.fillRect(tsLeft, top, timeWidth, 33);
+            ctx.fillStyle = white;
+            ctx.textAlign = 'center';
+            ctx.fillText(time, tsLeft + timeWidth / 2, top + 13);
+            ctx.fillText(subsecond, tsLeft + timeWidth / 2, top + 28);
+        }
+
+        const boxLeft = labelLeft(boxWidth);
+        let boxTop = top + 33 + labelGap;
+
+        ctx.textAlign = 'left';
+        readouts.forEach(({ text, bg, markerY }) => {
+            if (markerY >= top && markerY <= bottom) {
+                ctx.fillStyle = bg;
+                ctx.beginPath();
+                ctx.arc(left + x, markerY, markerRadius, 0, 2 * Math.PI);
+                ctx.fill();
             }
 
-            ctx.restore();
-        }
+            ctx.fillStyle = bg;
+            ctx.fillRect(boxLeft, boxTop, boxWidth, labelHeight);
+            ctx.fillStyle = white;
+            ctx.fillText(text, boxLeft + 5, boxTop + 13);
+            boxTop += labelHeight + labelGap;
+        });
 
-        if (offsetY < top || offsetY > bottom) {
-            canvas.style.cursor = 'default';
-            return;
-        }
-
-        canvas.style.cursor = 'pointer';
-
-        if (
-            plugin.moveEvent.drawY &&
-            yScale?.id === 'yScale' &&
-            formatY != null
-        ) {
-            ctx.save();
-            ctx.lineWidth = 0.5;
-            ctx.strokeStyle = color;
-            ctx.beginPath();
-            ctx.moveTo(left, y);
-            ctx.lineTo(right, y);
-            ctx.closePath();
-            ctx.stroke();
-
-            const yCoordinate = yScale.getValueForPixel(offsetY);
-            const nA = yCoordinate != null ? formatY(yCoordinate) : null;
-
-            if (nA != null) {
-                const { width: nAWidth } = ctx.measureText(nA);
-
-                ctx.fillStyle = color;
-                ctx.textAlign = 'right';
-                ctx.fillRect(
-                    right - nAWidth - 10,
-                    offsetY - 20,
-                    nAWidth + 10,
-                    20,
-                );
-                ctx.fillStyle = white;
-                ctx.fillText(nA, right - 5, offsetY - 7);
-            }
-
-            ctx.restore();
-        }
+        ctx.restore();
     },
 
     afterDestroy(chartInstance) {

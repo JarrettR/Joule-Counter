@@ -8,6 +8,7 @@ import { getCurrentWindow } from '@electron/remote';
 import path from 'path';
 import { v4 } from 'uuid';
 
+import { type StreamIntegrity } from './device/types';
 import { FileBuffer } from './utils/FileBuffer';
 import { FoldingBuffer } from './utils/foldingBuffer';
 import { fullOverlap, type Range, WriteBuffer } from './utils/WriteBuffer';
@@ -21,8 +22,8 @@ export const frameSize = currentFrameSize + voltageFrameSize + bitFrameSize;
 export const bufferLengthInSeconds = 60 * 5;
 export const numberOfDigitalChannels = 8;
 
-// Joule Counter firmware streams current + voltage pairs at 50 kHz.
-const initialSamplingTime = 20;
+// Joule Counter firmware streams current + voltage pairs at 100 kHz.
+const initialSamplingTime = 10;
 const initialSamplesPerSecond = 1e6 / initialSamplingTime;
 export const microSecondsPerSecond = 1e6;
 
@@ -45,6 +46,8 @@ export interface GlobalOptions {
     }[];
     inSyncOffset: number;
     lastInSyncTime: number;
+    /** losses of the stream this session came from; null if not known */
+    integrity: StreamIntegrity | null;
 }
 
 const options: GlobalOptions = {
@@ -52,6 +55,7 @@ const options: GlobalOptions = {
     timeReachedTriggers: [],
     inSyncOffset: 0,
     lastInSyncTime: 0,
+    integrity: null,
 };
 
 export class FileData {
@@ -246,6 +250,10 @@ export const DataManager = () => ({
         return inSync;
     },
     getStartSystemTime: () => options.fileBuffer?.getFirstWriteTime(),
+    getIntegrity: () => options.integrity,
+    setIntegrity: (integrity: StreamIntegrity | null) => {
+        options.integrity = integrity;
+    },
 
     // current in µA, voltage in V (NaN if unknown), bits as packed uint16.
     addData: (current: number, voltage: number, bits: number) => {
@@ -310,6 +318,7 @@ export const DataManager = () => ({
         options.foldingBuffer = undefined;
         options.samplesPerSecond = initialSamplesPerSecond;
         options.inSyncOffset = 0;
+        options.integrity = null;
     },
     initializeLiveSession: (sessionRootPath: string) => {
         const sessionPath = path.join(sessionRootPath, v4());

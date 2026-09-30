@@ -38,4 +38,6 @@ export interface DigitalChannelStates {
 export interface AmpereState {
     x: TimestampType;
     y: AmpereStateType;
+    /** samples behind this point went missing on the way from the kit */
+    missing?: boolean;
 }

@@ -423,8 +423,9 @@ size_t metadata_format(char *buf, size_t size)
 	}
 	PUT("IA: %u\n", m.ia);
 
-	/* Joule Counter additions: how to read the stream's voltage word, and
-	 * the sample rate, so the host carries no copy of either.
+	/* Joule Counter additions: how to scale the stream's voltage field,
+	 * the sample rate and the block format, so the host carries no copy
+	 * of any of them.
 	 */
 	float vfs, vdiv;
 
@@ -432,6 +433,7 @@ size_t metadata_format(char *buf, size_t size)
 	PUT("VFS: %.1f\n", (double)vfs);
 	PUT("VDIV: %.3f\n", (double)vdiv);
 	PUT("SampleRate: %u\n", PPK2_SAMPLE_RATE_HZ);
+	PUT("BlockFormat: %u\n", PPK2_BLOCK_VERSION);
 	PUT("END\n");
 #undef PUT
 

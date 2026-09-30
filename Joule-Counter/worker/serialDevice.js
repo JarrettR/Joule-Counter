@@ -45,16 +45,23 @@ process.on('message', msg => {
             baudRate: 115200,
         });
 
-        let data = Buffer.alloc(0);
+        // Collected per interval and joined once, instead of growing one
+        // buffer with a copy per read.
+        let chunks = [];
+        let size = 0;
         port.on('data', buf => {
-            data = Buffer.concat([data, buf]);
+            chunks.push(buf);
+            size += buf.length;
         });
         setInterval(() => {
-            if (data.length === 0) return;
-            process.send(data.slice(), err => {
+            if (size === 0) return;
+            const data =
+                chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size);
+            chunks = [];
+            size = 0;
+            process.send(data, err => {
                 if (err) console.log(err);
             });
-            data = Buffer.alloc(0);
         }, 30);
         port.open(err => {
             if (err) {

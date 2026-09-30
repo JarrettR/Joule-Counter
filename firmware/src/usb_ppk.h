@@ -29,4 +29,20 @@ bool usb_ppk_data_connected(void);
  */
 int usb_ppk_data_send(const uint8_t *data, size_t len, k_timeout_t timeout);
 
+struct net_buf;
+
+/*
+ * Zero-copy variant: reserves a transfer slot and a buffer of size bytes,
+ * waiting up to timeout for a slot. Fill buf->data, net_buf_add() what was
+ * written, then usb_ppk_data_submit() it, or hand it back unsent with
+ * usb_ppk_data_free(). Returns NULL with *err set to -ENOTCONN, -EAGAIN
+ * (no slot in time) or -ENOMEM.
+ */
+struct net_buf *usb_ppk_data_alloc(size_t size, k_timeout_t timeout, int *err);
+int usb_ppk_data_submit(struct net_buf *buf);
+void usb_ppk_data_free(struct net_buf *buf);
+
+/* Drops every transfer still queued on the data port, sent or not. */
+void usb_ppk_data_abort(void);
+
 #endif /* USB_PPK_H_ */

@@ -27,8 +27,8 @@ export const deviceSetupConfig: DeviceSetupConfig = {
                     // recognizes its own firmware as up to date instead of
                     // offering to overwrite it; anything else on a kit
                     // (stock or baseline/) gets the reprogram prompt.
-                    application: getAppFile('firmware/joule_counter_0.1.0.hex'),
-                    semver: 'joule_counter 0.1.0',
+                    application: getAppFile('firmware/joule_counter_0.2.0.hex'),
+                    semver: 'joule_counter 0.2.0',
                     params: {},
                 },
             ],

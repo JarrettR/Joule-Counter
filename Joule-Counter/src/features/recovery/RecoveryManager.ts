@@ -21,7 +21,10 @@ import {
     getSamplingTime,
 } from '../../globals';
 import { type RootState } from '../../slices';
-import { setSessionRecoveryPending } from '../../slices/appSlice';
+import {
+    setDataIntegrity,
+    setSessionRecoveryPending,
+} from '../../slices/appSlice';
 import {
     chartWindowAction,
     getWindowDuration,
@@ -102,6 +105,8 @@ export class RecoveryManager {
                 const sessionPath = path.dirname(session.filePath);
 
                 await DataManager().reset();
+                // A recovered session never had its losses saved.
+                dispatch(setDataIntegrity(null));
                 dispatch(resetChartTime());
                 dispatch(resetMinimap());
                 dispatch(setLiveMode(false));

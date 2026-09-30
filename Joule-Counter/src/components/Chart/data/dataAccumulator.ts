@@ -35,12 +35,18 @@ export interface RangeStats {
     energy: number;
     /** mean DUT voltage, V; NaN if no voltage */
     voltage: number;
+    /** samples in the range that never arrived */
+    missing: number;
 }
 
 /*
  * Energy is summed sample by sample rather than taken as average current ×
  * average voltage × time: through a pulsed load those two differ, and the
  * whole point of pairing V and I per sample is to get this right.
+ *
+ * Samples that never arrived count at the mean of the ones that did, for
+ * charge and energy alike: the best estimate without them, and the same one
+ * the window statistics make.
  */
 export const calcStats = (
     onComplete: (stats: RangeStats) => void,
@@ -71,8 +77,8 @@ export const calcStats = (
     let powerSum = 0; // µW summed over samples
     let voltageSum = 0;
     let voltageLen = 0;
+    let missing = 0;
     const oneValueDelta = indexToTimestamp(1);
-    const dtSeconds = oneValueDelta / 1e6;
 
     const process = (b: number, e: number) =>
         new Promise<{ begin: number; end: number }>(res => {
@@ -83,7 +89,9 @@ export const calcStats = (
                         onProgress?.((b / (end - begin)) * 100);
                         for (let n = 0; n < data.getLength(); n += 1) {
                             const v = data.getCurrentData(n);
-                            if (!Number.isNaN(v)) {
+                            if (Number.isNaN(v)) {
+                                missing += 1;
+                            } else {
                                 if (max === undefined || v > max) {
                                     max = v;
                                 }
@@ -121,8 +129,14 @@ export const calcStats = (
                     average: sum / (len || 1),
                     max: max ?? 0,
                     delta,
-                    energy: voltageLen > 0 ? powerSum * dtSeconds : NaN,
+                    // mean power (µW) × duration (s) = µJ; with nothing
+                    // missing this is the plain sum of V·I·dt
+                    energy:
+                        voltageLen > 0
+                            ? (powerSum / voltageLen) * (delta / 1e6)
+                            : NaN,
                     voltage: voltageLen > 0 ? voltageSum / voltageLen : NaN,
+                    missing,
                 });
             } else {
                 process(range.begin, range.end);
@@ -156,12 +170,14 @@ export interface DataAccumulator {
 /** y is a running sum over count samples, so groups can be merged exactly.
  * partial marks a trailing group that had not filled when it was read (the
  * live edge): still valid for totals, not stable enough to draw as a mean.
+ * missing counts the group's samples that never arrived.
  */
 export type AverageLine = {
     x: TimestampType;
     y: number;
     count: number;
     partial?: boolean;
+    missing?: number;
 };
 
 export type AccumulatedResult = {
@@ -228,18 +244,25 @@ const accumulate = async (
             const volt = data.getVoltageData(index);
             const bits = data.getBitData(index);
             const timestamp = begin + index * timeGroup;
-            if (!Number.isNaN(v) && index < numberOfElements) {
+            const missing = Number.isNaN(v);
+            if (!missing) {
                 bitAccumulator?.processBits(bits);
                 bitAccumulator?.processAccumulatedBits(timestamp);
                 if (!Number.isNaN(volt)) {
                     powerLine.push({ x: timestamp, y: v * volt, count: 1 });
                     voltageLine.push({ x: timestamp, y: volt, count: 1 });
                 }
+            } else {
+                // Keeps the gap in the power and voltage lines too, rather
+                // than joining the samples either side of it.
+                powerLine.push({ x: timestamp, y: 0, count: 0, missing: 1 });
+                voltageLine.push({ x: timestamp, y: 0, count: 0, missing: 1 });
             }
 
             ampereLineData[index] = {
                 x: timestamp,
                 y: v * 1000,
+                ...(missing && { missing: true }),
             };
         }
 
@@ -251,9 +274,11 @@ const accumulate = async (
                     mainLine: [],
                     uncertaintyLine: [],
                 }),
-            averageLine: ampereLineData
-                .filter(d => !Number.isNaN(d.y))
-                .map(d => ({ ...d, count: 1 }) as AverageLine),
+            averageLine: ampereLineData.map(d =>
+                d.missing
+                    ? { x: d.x, y: 0, count: 0, missing: 1 }
+                    : ({ x: d.x, y: d.y, count: 1 } as AverageLine),
+            ),
             powerLine,
             voltageLine,
         };
@@ -269,6 +294,7 @@ const accumulate = async (
 
     let min: number = Number.MAX_VALUE;
     let max: number = -Number.MAX_VALUE;
+    let missing = 0;
 
     let timestamp = begin;
     for (let index = 0; index < numberOfElements; index += 1) {
@@ -282,6 +308,7 @@ const accumulate = async (
         if (firstItemInGrp) {
             min = Number.MAX_VALUE;
             max = -Number.MAX_VALUE;
+            missing = 0;
 
             averageLine[groupIndex] = {
                 x: timestamp,
@@ -311,16 +338,26 @@ const accumulate = async (
                 y: averageLine[groupIndex].y + v,
                 count: averageLine[groupIndex].count + 1,
             };
+        } else {
+            missing += 1;
+        }
+
+        if (missing > 0) {
+            averageLine[groupIndex].missing = missing;
+            powerLine[groupIndex].missing = missing;
+            voltageLine[groupIndex].missing = missing;
         }
 
         ampereLineData[groupIndex * 2] = {
             x: timestamp,
             y: min > max ? undefined : min,
+            ...(missing > 0 && { missing: true }),
         };
 
         ampereLineData[(groupIndex + 1) * 2 - 1] = {
             x: timestamp,
             y: min > max ? undefined : max,
+            ...(missing > 0 && { missing: true }),
         };
 
         if (lastItemInGrp) {

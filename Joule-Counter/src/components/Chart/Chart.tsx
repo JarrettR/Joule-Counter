@@ -39,7 +39,11 @@ import {
     useLazyInitializedRef,
 } from '../../hooks/useLazyInitializedRef';
 import { type RootState } from '../../slices';
-import { isSamplingRunning } from '../../slices/appSlice';
+import {
+    getDataIntegrity,
+    isFileLoaded,
+    isSamplingRunning,
+} from '../../slices/appSlice';
 import {
     chartCursorAction,
     chartWindowAction,
@@ -49,11 +53,13 @@ import {
     getForceRerender,
     getRecordingMode,
     isLiveMode,
+    isSessionActive,
     MAX_WINDOW_DURATION,
     setFPS,
     setLiveMode,
 } from '../../slices/chartSlice';
 import { getProgress } from '../../slices/triggerSlice';
+import { formatDurationHTML } from '../../utils/duration';
 import { isDataLoggerPane } from '../../utils/panes';
 import { type booleanTupleOf8 } from '../../utils/persistentStore';
 import type { AmpereChartJS } from './AmpereChart';
@@ -66,6 +72,7 @@ import dataAccumulatorInitialiser, {
 import { type AmpereState, type DigitalChannelStates } from './data/dataTypes';
 import DigitalChannels from './DigitalChannels';
 import SelectionStatBox from './SelectionStatBox';
+import { ValueRaw } from './StatBoxHelpers';
 import TimeSpanBottom from './TimeSpan/TimeSpanBottom';
 import TimeSpanTop from './TimeSpan/TimeSpanTop';
 import WindowStatBox from './WindowStatBox';
@@ -117,6 +124,7 @@ const updateChart = async (
     windowEnd: number,
     setData: (data: {
         ampereLineData: AmpereState[];
+        currentMeanLineData: AmpereState[];
         powerLineData: AmpereState[];
         voltageLineData: AmpereState[];
         bitsLineData: DigitalChannelStates[];
@@ -198,14 +206,26 @@ const updateChart = async (
             y: number;
             count: number;
             partial?: boolean;
+            missing?: number;
         }[],
     ) =>
         line.map(p => ({
             x: p.x,
             y: p.count > 0 && !p.partial ? p.y / p.count : undefined,
+            ...((p.missing ?? 0) > 0 && { missing: true }),
         }));
     const powerLineData: AmpereState[] = meanLine(processedData.powerLine);
     const voltageLineData: AmpereState[] = meanLine(processedData.voltageLine);
+    // The current trace is a min/max band once zoomed out; the crosshair
+    // reads the mean instead, like it does for power and voltage.
+    const currentMeanLineData: AmpereState[] = meanLine(
+        processedData.averageLine,
+    );
+
+    const missing = processedData.averageLine.reduce(
+        (n, p) => n + (p.missing ?? 0),
+        0,
+    );
 
     const delta =
         DataManager().getTotalSavedRecords() > 0
@@ -216,6 +236,7 @@ const updateChart = async (
 
     setData({
         ampereLineData: processedData.ampereLineData,
+        currentMeanLineData,
         powerLineData,
         voltageLineData,
         bitsLineData: processedData.bitsLineData,
@@ -234,8 +255,97 @@ const updateChart = async (
             voltageTotals.count > 0
                 ? voltageTotals.sum / voltageTotals.count
                 : NaN,
+        missing,
     });
 };
+
+const formatCount = (n: number) => n.toLocaleString('en-US');
+
+/*
+ * How much of the stream never made it into the data on screen, and why:
+ * counted by the device while sampling, saved with the session, and shown
+ * again when it is loaded.
+ */
+export const DataIntegrityStatBox = () => {
+    const integrity = useSelector(getDataIntegrity);
+    const samplingRunning = useSelector(isSamplingRunning);
+    const fileLoaded = useSelector(isFileLoaded);
+    const sessionActive = useSelector(isSessionActive);
+
+    let source = '';
+    if (integrity) {
+        if (samplingRunning) source = 'since sampling started';
+        else if (fileLoaded) source = 'as saved with the session';
+        else source = 'last recording';
+    }
+
+    const lostTime = integrity
+        ? integrity.lostSamples * integrity.samplingTimeUs
+        : 0;
+
+    return (
+        <div className="tw-preflight tw-flex tw-w-full tw-flex-col tw-gap-1 tw-text-center">
+            <div className="tw-flex tw-h-3.5 tw-items-center tw-justify-between">
+                <h2 className="tw-inline tw-text-[10px] tw-uppercase">
+                    Data integrity
+                </h2>
+                <span className="tw-text-[10px]">{source}</span>
+            </div>
+            <div className="tw-flex tw-flex-row tw-gap-[1px] tw-border tw-border-solid tw-border-gray-200 tw-bg-gray-200">
+                {integrity ? (
+                    <>
+                        <ValueRaw
+                            label="lost data"
+                            value={
+                                integrity.lostSamples > 0
+                                    ? formatDurationHTML(lostTime)
+                                    : 'none'
+                            }
+                            alert={integrity.lostSamples > 0}
+                            white
+                            title="Time covered by samples the kit took that never reached the app. They are marked red on the chart."
+                        />
+                        <ValueRaw
+                            label="lost samples"
+                            value={formatCount(integrity.lostSamples)}
+                            alert={integrity.lostSamples > 0}
+                            white
+                            title="The same, counted in samples at the kit's sample rate."
+                        />
+                        <ValueRaw
+                            label="gaps"
+                            value={formatCount(integrity.gaps)}
+                            alert={integrity.gaps > 0}
+                            white
+                            title="Separate stretches of lost samples."
+                        />
+                        <ValueRaw
+                            label="kit buffer overflows"
+                            value={formatCount(integrity.kitOverflows)}
+                            alert={integrity.kitOverflows > 0}
+                            white
+                            title="Gaps where the kit had to drop samples because the computer did not read them out fast enough, for example while busy or behind a USB hub."
+                        />
+                        <ValueRaw
+                            label="CRC errors"
+                            value={formatCount(integrity.crcErrors)}
+                            alert={integrity.crcErrors > 0}
+                            white
+                            title="Blocks of samples rejected because their checksum did not match: damaged on the way from the kit."
+                        />
+                    </>
+                ) : (
+                    <div className="tw-flex tw-h-14 tw-w-full tw-flex-row tw-items-center tw-justify-center tw-bg-gray-100 tw-text-xs tw-text-gray-700">
+                        {sessionActive
+                            ? 'Not recorded for this data. Missing samples are still marked red on the chart.'
+                            : 'Shown once sampling starts'}
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
 const Chart = () => {
     const dispatch = useDispatch<AppDispatch>();
     const recordingMode = useSelector(getRecordingMode);
@@ -439,11 +549,13 @@ const Chart = () => {
 
     const [data, setData] = useState<{
         ampereLineData: AmpereState[];
+        currentMeanLineData: AmpereState[];
         powerLineData: AmpereState[];
         voltageLineData: AmpereState[];
         bitsLineData: DigitalChannelStates[];
     }>({
         ampereLineData: [],
+        currentMeanLineData: [],
         powerLineData: [],
         voltageLineData: [],
         bitsLineData: [],
@@ -502,6 +614,7 @@ const Chart = () => {
         if (xAxisMax === 0) {
             setData({
                 ampereLineData: [],
+                currentMeanLineData: [],
                 powerLineData: [],
                 voltageLineData: [],
                 bitsLineData: [],
@@ -621,6 +734,7 @@ const Chart = () => {
                     chartRef={chartRef}
                     cursorData={cursorData}
                     lineData={data.ampereLineData}
+                    currentMeanLineData={data.currentMeanLineData}
                     powerLineData={data.powerLineData}
                     voltageLineData={data.voltageLineData}
                 />
@@ -645,6 +759,7 @@ const Chart = () => {
                             delta={windowStats?.delta ? windowStats.delta : 0}
                             energy={windowStats?.energy ?? NaN}
                             voltage={windowStats?.voltage ?? NaN}
+                            missing={windowStats?.missing ?? 0}
                         />
                         <SelectionStatBox
                             resetCursor={resetCursor}
@@ -654,6 +769,7 @@ const Chart = () => {
                             {...selectionStats}
                         />
                     </div>
+                    <DataIntegrityStatBox />
                 </div>
             </div>
             {digitalChannelsVisible && (

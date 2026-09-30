@@ -10,6 +10,7 @@ Examples:
     python ppktool.py identify COM20 COM21
     python ppktool.py metadata COM21
     python ppktool.py stream COM21 --seconds 2
+    python ppktool.py linktest COM21 --seconds 5
     python ppktool.py shell COM20
 """
 from __future__ import annotations
@@ -21,7 +22,23 @@ from collections import Counter
 
 import serial
 
-from ppk_protocol import PPKDataPort, RANGE_SWITCHING, Mode
+from ppk_protocol import (
+    FIELD_BITS,
+    FLAG_EXT_USB,
+    FLAG_LAST,
+    FLAG_OVERFLOW,
+    FLAG_TEST,
+    RANGE_MISSING,
+    RANGE_SWITCHING,
+    BlockParser,
+    Mode,
+    PPKDataPort,
+    test_block_samples,
+)
+
+# Uncalibrated VDUT: 0.6 V reference at gain 1/3, 13 bits of magnitude,
+# through the 120k/30k divider (the VFS/VDIV lines of the metadata).
+MV_PER_COUNT = 1800.0 / 8192.0 * 5.0
 
 
 def probe_port(port: str, timeout: float = 1.0) -> str:
@@ -70,64 +87,214 @@ def cmd_metadata(args: argparse.Namespace) -> None:
         print(dev.get_metadata(), end="")
 
 
-def cmd_stream(args: argparse.Namespace) -> None:
+class _Stats:
+    """Running count, mean and spread of raw 14-bit counts."""
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.sum = 0
+        self.sq = 0
+        self.min: int | None = None
+        self.max: int | None = None
+
+    def add(self, raw: int) -> None:
+        self.n += 1
+        self.sum += raw
+        self.sq += raw * raw
+        self.min = raw if self.min is None else min(self.min, raw)
+        self.max = raw if self.max is None else max(self.max, raw)
+
+    def mean_sd(self) -> tuple[float, float]:
+        mean = self.sum / self.n
+        return mean, max(self.sq / self.n - mean * mean, 0.0) ** 0.5
+
+
+def stream_words(dev: PPKDataPort, args: argparse.Namespace) -> None:
+    """PPK2 / baseline one-word stream."""
     ranges: Counter[int] = Counter()
-    adc_sum: Counter[int] = Counter()
-    adc_sq: Counter[int] = Counter()
-    v_sum = 0.0
-    v_sq = 0.0
-    v_min = None
-    v_max = None
+    per_range: dict[int, _Stats] = {}
     n = 0
     lost = 0
     expected_counter = None
     dump = open(args.dump, "wb") if args.dump else None
 
-    print(f"streaming for {args.seconds}s ...", file=sys.stderr)
-    with PPKDataPort(args.port) as dev:
-        for s in dev.read_samples(args.seconds, words=args.words):
-            n += 1
-            ranges[s.range] += 1
-            # The app scales the 12-bit field by 4 back to 14-bit counts.
-            raw = s.adc * 4
-            adc_sum[s.range] += raw
-            adc_sq[s.range] += raw * raw
-            if s.voltage_adc is not None:
-                vraw = s.voltage_adc * 4
-                v_sum += vraw
-                v_sq += vraw * vraw
-                v_min = vraw if v_min is None else min(v_min, vraw)
-                v_max = vraw if v_max is None else max(v_max, vraw)
-            if dump:
-                dump.write(s.word.to_bytes(4, "little"))
-                if s.voltage_adc is not None:
-                    dump.write(s.voltage_adc.to_bytes(4, "little"))
-            if expected_counter is not None and s.counter != expected_counter:
-                lost += (s.counter - expected_counter) & 0x3F
-            expected_counter = (s.counter + 1) & 0x3F
+    for s in dev.read_words(args.seconds):
+        n += 1
+        ranges[s.range] += 1
+        # The app scales the 12-bit field by 4 back to 14-bit counts.
+        per_range.setdefault(s.range, _Stats()).add(s.adc * 4)
+        if dump:
+            dump.write(s.word.to_bytes(4, "little"))
+        if expected_counter is not None and s.counter != expected_counter:
+            lost += (s.counter - expected_counter) & 0x3F
+        expected_counter = (s.counter + 1) & 0x3F
     if dump:
         dump.close()
 
     print(f"samples: {n}")
     if n:
-        print(f"implied rate: {n / args.seconds:.0f} Hz "
-              f"(expect ~{100000 if args.words == 1 else 50000}, minus start-up)")
-    print(f"counter gaps (lost/dropped): {lost}")
+        print(f"implied rate: {n / args.seconds:.0f} Hz (expect ~100000, minus start-up)")
+    print(f"counter gaps (lost, modulo 64): {lost}")
     for r in sorted(ranges):
         label = "switching" if r == RANGE_SWITCHING else str(r)
-        cnt = ranges[r]
-        mean = adc_sum[r] / cnt
-        sd = (adc_sq[r] / cnt - mean * mean) ** 0.5
-        print(f"  range {label}: {cnt} samples ({100 * cnt / n:.1f}%), "
+        mean, sd = per_range[r].mean_sd()
+        print(f"  range {label}: {ranges[r]} samples ({100 * ranges[r] / n:.1f}%), "
               f"raw adc mean {mean:.1f} sd {sd:.1f} (14-bit counts)")
-    if n and args.words > 1:
-        # Uncalibrated VDUT: 0.6 V reference at gain 1/3, 13 bits of
-        # magnitude, through the 120k/30k divider.
-        mv_per_count = 1800.0 / 8192.0 * 5.0
-        mean = v_sum / n
-        sd = (v_sq / n - mean * mean) ** 0.5
-        print(f"  voltage: raw adc mean {mean:.1f} sd {sd:.1f} min {v_min} max {v_max} "
-              f"(14-bit counts) = {mean * mv_per_count:.1f} mV, sd {sd * mv_per_count:.1f} mV")
+
+
+def stream_blocks(dev: PPKDataPort, args: argparse.Namespace) -> None:
+    """Joule Counter block stream: every sample has an index, so loss is exact."""
+    parser = BlockParser()
+    ranges: Counter[int] = Counter()
+    per_range: dict[int, _Stats] = {}
+    volt = _Stats()
+    logic_seen = 0
+    blocks = 0
+    received = 0
+    expected = None
+    gaps = []           # (first missing index, length, device overflow?)
+    streams = set()
+    flags_seen = 0
+    last_block = False
+    nbytes = 0
+    first_index = None
+    dump = open(args.dump, "wb") if args.dump else None
+
+    t0 = time.monotonic()
+    for block in dev.read_blocks(args.seconds, parser):
+        if block.flags & FLAG_TEST:
+            continue
+        blocks += 1
+        nbytes += len(block.raw)
+        streams.add(block.stream)
+        flags_seen |= block.flags
+        if dump:
+            dump.write(block.raw)
+        if first_index is None:
+            first_index = block.first
+            expected = block.first
+        if block.first != expected:
+            gaps.append((expected, block.first - expected, bool(block.flags & FLAG_OVERFLOW)))
+        expected = block.first + block.count
+        received += block.count
+        last_block = last_block or bool(block.flags & FLAG_LAST)
+        for s in block.samples():
+            ranges[s.range] += 1
+            logic_seen |= s.logic
+            if s.range == RANGE_MISSING:
+                continue
+            volt.add(s.voltage_adc * 4)
+            if s.range != RANGE_SWITCHING:
+                per_range.setdefault(s.range, _Stats()).add(s.adc * 4)
+    elapsed = time.monotonic() - t0
+    if dump:
+        dump.close()
+
+    slots = (expected - first_index) if first_index is not None else 0
+    lost = sum(g[1] for g in gaps)
+    print(f"blocks: {blocks} ({nbytes} bytes, {nbytes / max(elapsed, 1e-9) / 1000:.0f} kB/s "
+          f"over {elapsed:.2f} s incl. start/stop, {8 * nbytes / max(received, 1):.1f} bits/sample "
+          f"with headers), stream id(s) {sorted(streams)}, "
+          f"final block {'seen' if last_block else 'MISSING'}")
+    print(f"samples: {received} received of {slots} slots "
+          f"(index {first_index}..{expected - 1 if expected else 0}), "
+          f"{slots / args.seconds:.0f} Hz over the requested {args.seconds} s")
+    print(f"lost: {lost} samples in {len(gaps)} gaps"
+          + "".join(f"\n  at {g[0]}: {g[1]} ({'device ring overflow' if g[2] else 'in transit'})"
+                    for g in gaps[:10]))
+    print(f"link: {parser.crc_errors} CRC errors, {parser.skipped_bytes} bytes skipped, "
+          f"J1 VBUS {'present' if flags_seen & FLAG_EXT_USB else 'absent'}")
+    total = sum(ranges.values())
+    for r in sorted(ranges):
+        label = {RANGE_SWITCHING: "switching", RANGE_MISSING: "missing"}.get(r, str(r))
+        line = f"  range {label}: {ranges[r]} samples ({100 * ranges[r] / total:.2f}%)"
+        if r in per_range:
+            mean, sd = per_range[r].mean_sd()
+            line += f", raw adc mean {mean:.1f} sd {sd:.1f} (14-bit counts)"
+        print(line)
+    if volt.n:
+        mean, sd = volt.mean_sd()
+        print(f"  voltage: raw adc mean {mean:.1f} sd {sd:.1f} min {volt.min} max {volt.max} "
+              f"(14-bit counts) = {mean * MV_PER_COUNT:.1f} mV, sd {sd * MV_PER_COUNT:.1f} mV")
+    print(f"  logic: bits seen high {logic_seen:#04x}")
+
+
+def cmd_stream(args: argparse.Namespace) -> None:
+    print(f"streaming for {args.seconds}s ...", file=sys.stderr)
+    with PPKDataPort(args.port) as dev:
+        fmt = args.format
+        if fmt == "auto":
+            fmt = "blocks" if "BlockFormat:" in dev.get_metadata() else "ppk2"
+        if fmt == "blocks":
+            stream_blocks(dev, args)
+        else:
+            stream_words(dev, args)
+
+
+def cmd_linktest(args: argparse.Namespace) -> None:
+    """Measures what the USB link sustains, using the firmware's test blocks.
+
+    Plain blocks are full width, the stream's worst case. With --pack they
+    carry pseudo-random samples packed like the stream, and every one is
+    checked against this side's copy of the generator.
+    """
+    parser = BlockParser()
+    blocks = 0
+    bad = 0
+    gaps = 0
+    expected = 0
+    nbytes = 0
+    samples = 0
+    bits = 0
+    t_first = t_end = None
+
+    with PPKDataPort(args.port) as dev:
+        dev._ser.reset_input_buffer()
+        dev._ser.timeout = 0.05
+        dev.link_test(args.seconds, pack=args.pack)
+        deadline = time.monotonic() + args.seconds + 5.0
+        done = False
+        while not done and time.monotonic() < deadline:
+            chunk = dev._ser.read(65536)
+            if not chunk:
+                continue
+            now = time.monotonic()
+            for block in parser.feed(chunk):
+                if not block.flags & FLAG_TEST:
+                    continue
+                if block.flags & FLAG_LAST:
+                    done = True
+                    t_end = now
+                    break
+                if t_first is None:
+                    t_first = now
+                    expected = block.first
+                else:
+                    blocks += 1
+                    nbytes += len(block.raw)
+                if block.first != expected:
+                    gaps += 1
+                expected = block.first + block.count
+                samples += block.count
+                bits += block.count * block.sample_bits
+                if args.pack:
+                    got = [(s.adc, s.range, s.voltage_adc, s.logic) for s in block.samples()]
+                    bad += got != test_block_samples(block.first + 1, block.count)
+                else:
+                    bad += block.widths != FIELD_BITS or any(
+                        w != (block.first + k) & 0xFFFFFFFF for k, w in enumerate(block.words))
+
+    if t_first is None or t_end is None or t_end <= t_first:
+        sys.exit("no complete link test received")
+    elapsed = t_end - t_first
+    rate = nbytes / elapsed
+    per_s = blocks * 512 / elapsed
+    print(f"{blocks} blocks, {nbytes} bytes in {elapsed:.2f} s: {rate / 1000:.0f} kB/s "
+          f"= {per_s:,.0f} samples/s at {bits / max(samples, 1):.1f} bits/sample "
+          f"({per_s / 100000:.2f}x the 100 kHz stream)")
+    print(f"{'decoded samples wrong' if args.pack else 'pattern errors'} in {bad} blocks, "
+          f"sequence gaps {gaps}, CRC errors {parser.crc_errors}, "
+          f"bytes skipped {parser.skipped_bytes}")
 
 
 def cmd_output(args: argparse.Namespace) -> None:
@@ -192,10 +359,19 @@ def main() -> None:
     p = sub.add_parser("stream", help="start sampling, decode, report stats (data port)")
     p.add_argument("port")
     p.add_argument("--seconds", type=float, default=2.0)
-    p.add_argument("--dump", metavar="FILE", help="also write the raw 32-bit sample words here")
-    p.add_argument("--words", type=int, choices=[1, 2], default=1,
-                   help="32-bit words per sample: 1 = PPK2/baseline format, 2 = Joule Counter (adds voltage)")
+    p.add_argument("--dump", metavar="FILE",
+                   help="also write the raw stream here (blocks, or 32-bit words for ppk2)")
+    p.add_argument("--format", choices=["auto", "blocks", "ppk2"], default="auto",
+                   help="blocks = Joule Counter firmware/, ppk2 = one word per sample "
+                        "(baseline/, stock); auto asks the metadata")
     p.set_defaults(func=cmd_stream)
+
+    p = sub.add_parser("linktest", help="measure USB throughput with a test pattern (firmware/ only)")
+    p.add_argument("port")
+    p.add_argument("--seconds", type=int, default=5, choices=range(1, 61), metavar="1-60")
+    p.add_argument("--pack", action="store_true",
+                   help="pseudo-random packed samples, each checked against the generator")
+    p.set_defaults(func=cmd_linktest)
 
     p = sub.add_parser("output", help="set mode / vdd / DUT power (data port)")
     p.add_argument("port")

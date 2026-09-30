@@ -35,6 +35,7 @@ import type { RootState } from '../slices';
 import {
     getDiskFullTrigger,
     getSessionRootFolder,
+    setDataIntegrity,
     setFileLoadedAction,
     setSavePending,
 } from '../slices/appSlice';
@@ -85,6 +86,7 @@ export const save =
                 samplesPerSecond: DataManager().getSamplesPerSecond(),
                 startSystemTime: DataManager().getStartSystemTime(),
             },
+            integrity: DataManager().getIntegrity() ?? undefined,
         };
 
         if (!filename.toLocaleLowerCase().endsWith('.ppk2')) {
@@ -152,6 +154,7 @@ export const load =
         logger.info(`Restoring state from ${filename}`);
         resetCache();
         await DataManager().reset();
+        dispatch(setDataIntegrity(null));
         dispatch(resetChartTime());
         dispatch(resetMinimap());
         dispatch(setLiveMode(false));
@@ -177,6 +180,7 @@ export const load =
 
             dispatch(setCurrentPane(Panes.DATA_LOGGER));
             dispatch(closeProgressDialog());
+            dispatch(setDataIntegrity(DataManager().getIntegrity()));
 
             if (timestamp) {
                 dispatch(setLatestDataTimestamp(timestamp));
